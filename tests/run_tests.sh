@@ -30,6 +30,25 @@ import json; b = json.load(open("out/test/lifo.json"))["containers"][0]["boxes"]
 s1 = min(x["x"] for x in b if x["stop"] == 1); s2 = max(x["x"] for x in b if x["stop"] == 2)
 assert s1 > s2, (s1, s2)
 PY
+# 3b) importer: forwarder loading-manifest layout (container label above the header, 件数/实重/方数 are line totals,
+#     carton size in one "a×b×c cm" column, continuation lines without 件数). Fake values only.
+mkdir -p out/test/manifest
+cat > out/test/manifest/m.csv <<'P'
+柜号,TEST-1,,,,
+装柜开始时间,,,装柜结束时间,,
+服务商单号,件数,实重,方数,货品尺寸,中文品名
+T001,10,100,0.6,50×40×30cm,甲
+,,,,,乙
+T002,4,80,1.2,超大件,丙
+P
+PEICANG_DATA=out/test/manifest python3 tools/import_xlsx.py convert --out out/test/manifest-out --existing-type 45HC --est-dims >/dev/null
+python3 - <<'PY' && echo "ok   import-manifest" || { echo "FAIL import-manifest"; fail=1; }
+import json; r = [x for x in json.load(open("out/test/manifest-out/import_report.json")) if "file" in x]
+assert len(r) == 1 and r[0]["group"] == "sheet" and r[0]["boxes"] == 14, r
+assert r[0]["existing_containers"] == 1 and r[0]["existing_types"] == ["45HC"] and r[0]["boxes_dims_estimated"] == 4, r
+I = [l.split() for l in open("out/test/manifest-out/" + r[0]["file"]) if l.startswith("I ")]
+assert I[0][3:8] == ["500", "400", "300", "10.0", "10"], I[0]   # cm -> mm, line weight / 件数
+PY
 # 4) Aura coordinator: one winner commits, the rest roll back, report written
 PC_TIME_MS=1500 PC_ORDERS="$(ls out/test/orders/*.txt | head -2 | tr '\n' ' ')" PC_OUT=out/test/aura \
   script -qc "scripts/aura.sh aura/main.aura" /dev/null > out/test/aura.log 2>&1 || true

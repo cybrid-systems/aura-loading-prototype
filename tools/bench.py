@@ -72,7 +72,7 @@ def main():
     per = [{"order": r["order"], "boxes": r["B0"]["metrics"]["boxes"],
             **{k: {"containers": r[k]["metrics"]["containers"], "mix": r[k]["metrics"]["mix"], "cost": r[k]["metrics"]["cost"],
                    "vol_util": round(r[k]["metrics"]["vol_util"], 4), "feasible": not r[k + "_errs"]} for k in keys},
-            "lower_bound": r["B0"]["metrics"]["lower_bound"], "agent": r.get("AURA_agent"), "aura_ms": r.get("AURA_ms"),
+            "lower_bound": r["B1"]["metrics"]["lower_bound"], "agent": r.get("AURA_agent"), "aura_ms": r.get("AURA_ms"),
             "existing": exist.get(r["order"], {}).get("existing_containers"),
             "existing_types": exist.get(r["order"], {}).get("existing_types")} for r in rows]
     json.dump({"summary": summary, "orders": per}, open(os.path.join(a.out, "bench.json"), "w"), ensure_ascii=False, indent=1)
@@ -84,11 +84,23 @@ def main():
     L += ["", "| 方案 | 总柜数 | 总相对运费 | 加权体积利用率 | 不可行方案数 |", "|---|---|---|---|---|"]
     for k in keys:
         s = summary[k]; L.append(f"| {k} | {s['containers']} | {s['cost']:.2f} | {s['vol_util']*100:.1f}% | {s['infeasible']} |")
-    lb = summary["B0"]["lower_bound"]
+    lb = summary["B1"]["lower_bound"]  # B0 is restricted to 40HQ, so its bound is not the all-types bound
     ex = [o for o in per if o["existing"]]
-    if ex and a.aura:
-        e_tot = sum(o["existing"] for o in ex); a_tot = sum(o["AURA"]["containers"] for o in ex)
-        L += ["", f"- 有现有装柜记录的订单 {len(ex)} 个：现有方案共 {e_tot} 柜，AURA {a_tot} 柜（{(a_tot-e_tot)/e_tot*100:+.1f}%）"]
+    if ex:
+        import containers as _ct
+        cost_of = {c[0]: c[5] for c in _ct.load()}
+        known = all(t in cost_of for o in ex for t in (o["existing_types"] or ["?"]))
+        e_tot = sum(o["existing"] for o in ex)
+        # one type per order is the common case (a manifest per container); mixed types are costed by their first type
+        e_cost = sum(o["existing"] * cost_of.get((o["existing_types"] or ["?"])[0], float("nan")) for o in ex)
+        L += ["", f"现有装柜方案对比（{len(ex)} 个有装柜记录的订单/柜单；现有柜型" + ("按导入时 --existing-type 假设" if known else "未知") + "）：", "",
+              "| 方案 | 总柜数 | 相对现有柜数 | 总相对运费 | 相对现有运费 | 可行 |", "|---|---|---|---|---|---|",
+              f"| EXIST 现有方案 | {e_tot} | — | " + (f"{e_cost:.2f}" if known else "?") + " | — | — |"]
+        for k in keys:
+            c = sum(o[k]["containers"] for o in ex); co = sum(o[k]["cost"] for o in ex); feas = sum(1 for o in ex if o[k]["feasible"])
+            L.append(f"| {k} | {c} | {(c-e_tot)/e_tot*100:+.1f}% | {co:.2f} | " + (f"{(co-e_cost)/e_cost*100:+.1f}%" if known else "?") + f" | {feas}/{len(ex)} |")
+        summary["EXIST"] = {"containers": e_tot, "cost": round(e_cost, 3) if known else None, "orders": len(ex)}
+        json.dump({"summary": summary, "orders": per}, open(os.path.join(a.out, "bench.json"), "w"), ensure_ascii=False, indent=1)
     if a.aura:
         b0, au = summary["B0"], summary["AURA"]
         L += ["", f"- AURA 相对 B0：柜数 {b0['containers']} → {au['containers']}（{(au['containers']-b0['containers'])/b0['containers']*100:+.1f}%），"
