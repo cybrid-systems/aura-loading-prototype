@@ -1,0 +1,20 @@
+{
+ "R1": [
+  "examples/pool/route_1.txt"
+ ],
+ "R2": [
+  "examples/pool/route_2.txt"
+ ],
+ "R3": [
+  "examples/pool/route_3.txt"
+ ],
+ "R4": [
+  "examples/pool/route_4.txt"
+ ],
+ "R5": [
+  "examples/pool/route_5.txt"
+ ],
+ "R6": [
+  "examples/pool/route_6.txt"
+ ]
+}

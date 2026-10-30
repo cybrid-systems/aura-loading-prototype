@@ -1,0 +1,27 @@
+;; aura/consolidate-main.aura — 拼柜多 Agent 入口
+;; PC_CONS_GROUPS=pools.json PC_OUT=out/cons-aura [PC_CONS_TIME_S=30 PC_CONS_J=1 PC_CONS_RULES=...]
+(define out-dir (env-or "PC_OUT" "out/cons-aura"))
+(sh (string-append "mkdir -p " out-dir))
+(define r (cons-decide (env-or "PC_CONS_GROUPS" "examples/pool/pools.json") out-dir))
+(define lines (list "# 拼柜决策解释（Aura 协调器生成）" ""))
+(define (add! s) (set! lines (append lines (list s))))
+(define tsv (list))
+(for-each
+  (lambda (pp)
+    (let ((w (cadr pp)))
+      (add! (format "## ~a" (car pp)))
+      (if w (begin
+              (add! (format "- 采用：**~a** Agent（~a）：~a 柜（~a），相对运费 ~a，体积装载率 ~a%，下界运费 ~a"
+                            (car w) (cadr w) (hget (caddr w) "containers" "?") (hget (caddr w) "mix" "?") (hget (caddr w) "cost" "?")
+                            (r3 (* 100 (hget (caddr w) "vol_util" 0))) (hget (caddr w) "lb_cost" "?")))
+              (set! tsv (cons (format "~a\t~a\t~a\t~a\t~a" (car pp) (car w) (hget (caddr w) "containers" 0) (hget (caddr w) "mix" "") (hget (caddr w) "cost" 0)) tsv)))
+          (add! "- 没有满足现场规则的方案"))
+      (for-each (lambda (c) (add! (format "- ~a：~a 柜（~a），运费 ~a" (car c) (hget (caddr c) "containers" "?") (hget (caddr c) "mix" "?") (hget (caddr c) "cost" "?"))))
+                (if (null? (caddr pp)) (list) (cdr (caddr pp))))
+      (for-each (lambda (b) (add! (format "- 否决 ~a：~a" (car b) (join-strings (cadr b) "；")))) (list-ref pp 3))))
+  (car r))
+(add! "")
+(add! (format "- overlay：提案期间全局 chosen-consolidation=~a，裁决后=~a；~a" (caddr r) (list-ref r 3) (join-strings (cadr r) ", ")))
+(write-file (string-append out-dir "/explain.md") (join-strings lines "\n"))
+(write-file (string-append out-dir "/cons-summary.tsv") (join-strings (reverse tsv) "\n"))
+(display "@@done=ok") (newline)

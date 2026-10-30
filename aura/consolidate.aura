@@ -1,0 +1,86 @@
+;; aura/consolidate.aura — 拼柜多 Agent：每个 Agent 是一种拼柜搜索思路（tools/consolidate.py 的一组参数），
+;; 各在自己的 fiber + COW overlay 里跑，协调器按规则否决 + 选运费最低的，只让胜出者 commit。
+;;
+;;   (cons-agent 名称 "显示名" "consolidate.py 参数" "说明")
+;;   (cons-hard max-types N "说明")   —— 现场规则：一条线路最多用 N 种柜型（例如堆场只有两种柜）
+;;   (cons-hard max-containers N "说明")
+;; 规则是数据：换 PC_CONS_RULES 文件即可改 Agent 组合和现场约束，不改代码。
+
+(define cons-rules-default
+  '((cons-agent vol     "体积优先"   "--seed-order vol --seed 1 --oracle wall,human"   "大票先装（FFD 起点）+ LNS")
+    (cons-agent kg      "重量优先"   "--seed-order kg --seed 2 --oracle wall,human"    "重票先装：重量接近限重的线路更容易先撞重量上限")
+    (cons-agent arrival "到货顺序"   "--seed-order arrival --seed 3 --oracle wall,human" "从按到货顺序的人工式方案出发再改进")
+    (cons-agent corner  "块式预言机" "--seed-order vol --seed 4 --oracle block,layer"  "柜内可行性改用块式/层式构造判定")
+    (cons-hard max-types 3 "一条线路最多用 3 种柜型")))
+
+(define *cons-rules*
+  (let ((f (env-or "PC_CONS_RULES" #f))) (if f (read-from-string (read-file f)) cons-rules-default)))
+(define (cons-of kind) (filter (lambda (r) (eq? (car r) kind)) *cons-rules*))
+(define (cons-hard-num name d)
+  (let loop ((xs (cons-of 'cons-hard))) (cond ((null? xs) d) ((eq? (cadr (car xs)) name) (caddr (car xs))) (else (loop (cdr xs))))))
+
+(define *cons-time* (env-or "PC_CONS_TIME_S" "30"))
+(define *cons-j* (env-or "PC_CONS_J" "1"))
+(define *cons-extra* (env-or "PC_CONS_EXTRA" ""))
+
+(define (count-char s ch) (length (filter (lambda (c) (char=? c ch)) (string->list s))))
+;; 现场规则检查：返回违规说明列表（空 = 通过）
+(define (cons-violations m)
+  (let ((types (+ 1 (count-char (hget m "mix" "") #\+))) (n (hget m "containers" 0)) (errs (list)))
+    (if (> types (cons-hard-num 'max-types 99)) (set! errs (cons (format "用了 ~a 种柜型 > ~a" types (cons-hard-num 'max-types 99)) errs)) #f)
+    (if (> n (cons-hard-num 'max-containers 9999)) (set! errs (cons (format "~a 个柜 > ~a" n (cons-hard-num 'max-containers 9999)) errs)) #f)
+    errs))
+
+(define (cons-launch groups out a)
+  (let ((done (string-append out ".done")))
+    (sh (string-append "rm -rf " out " " done "; mkdir -p " out))
+    (sh (string-append "( python3 tools/consolidate.py --groups " groups " --algo lns --out " out " --work " out "-work"
+                       " --time-s " *cons-time* " -j " *cons-j* " " (caddr (cdr a)) " " *cons-extra*
+                       " > " out ".log 2>&1; echo $? > " done " ) &"))
+    done))
+
+;; 一批线路的拼柜决策：每条线路独立选优。返回 ((线路 胜者 metrics 其余提案 否决) ...) 和 overlay 状态
+(define (cons-decide groups out-dir)
+  (let* ((ags (cons-of 'cons-agent)) (n (length ags))
+         (res (channel:create 16)) (fin (channel:create 16))
+         (verdicts (map (lambda (a) (channel:create 1)) ags))
+         (fs (map (lambda (k)
+                    (let ((a (list-ref ags k)) (vch (list-ref verdicts k)))
+                      (spawn-reporting fin (cadr a)
+                        (lambda ()
+                          (let ((a a) (k k) (vch vch) (res res) (groups groups) (out-dir out-dir))
+                            (fiber:overlay-begin)
+                            (let* ((out (format "~a/agent-~a" out-dir (cadr a))) (done (cons-launch groups out a)))
+                              (await-file done)
+                              (fiber:overlay-define "chosen-consolidation" out)
+                              (channel:send res (list (cadr a) (caddr a) out))
+                              (let ((v (channel:recv vch)))
+                                (if (equal? v "commit")
+                                    (begin (fiber:overlay-commit) (format "~a:committed" (cadr a)))
+                                    (begin (fiber:overlay-rollback) (format "~a:rolled-back" (cadr a)))))))))))
+                  (range n)))
+         ;; json-parse 只在主 fiber 做（aura#4788）
+         (props (map (lambda (m) (list (car m) (cadr m) (try (json-parse (read-file (string-append (caddr m) "/summary.lns.json"))) (catch (e) #f))))
+                     (map (lambda (f) (channel:recv res)) fs)))
+         (pools (if (and (not (null? props)) (caddr (car props))) (map (lambda (m) (hget m "pool" "?")) (caddr (car props))) (list)))
+         (per-pool
+           (map (lambda (pool)
+                  (let* ((cands (filter (lambda (x) (cadr (cdr x)))
+                                        (map (lambda (p) (list (car p) (cadr p)
+                                                               (if (caddr p) (let ((ms (filter (lambda (m) (equal? (hget m "pool" "") pool)) (caddr p))))
+                                                                               (if (null? ms) #f (car ms))) #f)))
+                                             props)))
+                         (ok (filter (lambda (c) (null? (cons-violations (caddr c)))) cands))
+                         (bad (filter (lambda (c) (not (null? (cons-violations (caddr c))))) cands))
+                         (sorted (list-sort (lambda (x y) (let ((cx (hget (caddr x) "cost" 1e9)) (cy (hget (caddr y) "cost" 1e9)))
+                                                            (or (< cx cy) (and (= cx cy) (> (hget (caddr x) "vol_util" 0) (hget (caddr y) "vol_util" 0))))))
+                                            ok)))
+                    (list pool (if (null? sorted) #f (car sorted)) sorted (map (lambda (c) (list (car c) (cons-violations (caddr c)))) bad))))
+                pools))
+         ;; 一个 Agent 至少赢一条线路就 commit 它的 overlay（它的方案被采用），否则 rollback
+         (winners (map (lambda (pp) (if (cadr pp) (car (cadr pp)) "")) per-pool))
+         (before (safe (lambda () chosen-consolidation) "unbound")))
+    (for-each (lambda (k) (channel:send (list-ref verdicts k) (if (member (cadr (list-ref ags k)) winners) "commit" "rollback"))) (range n))
+    (let ((statuses (map (lambda (f) (channel:recv fin)) fs)))
+      (for-each fiber:join fs)
+      (list per-pool statuses before (safe (lambda () chosen-consolidation) "unbound")))))
