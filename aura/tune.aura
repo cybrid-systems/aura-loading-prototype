@@ -8,6 +8,7 @@
 
 (define active-strategies *strategies*)
 (define *tune-extra* (env-or "PC_TUNE_EXTRA" "only=45HC maxbins=1 width=4 noise=0 time_ms=600000"))
+(define *tune-margin* (string->number (env-or "PC_TUNE_MARGIN" "0.0005")))  ;; 装载率之和至少提升这么多才算提升（随机搜索有噪声时调大）
 (define *tune-par* (string->number (env-or "PC_TUNE_PAR" "4")))   ;; 同时回放的候选数（每个候选一个后台进程串行跑训练集）
 
 (define (human-params rs) (constructor->params rs (find-srule rs 'constructor 'human)))
@@ -75,7 +76,7 @@
                                                 (reason (cond ((not (tune-floor-ok? rs)) "放松了刚性底线（压缩/倒放）")
                                                               ((> (caddr r) 0) "有方案没通过独立校验")
                                                               ((> (cadr r) (cadr base)) "重心违例上升")
-                                                              ((<= (car r) (+ (car base) 0.0005)) "装载率没有提升")
+                                                              ((<= (car r) (+ (car base) *tune-margin*)) "装载率没有提升（未超过噪声阈值）")
                                                               (else #f))))
                                            ;; 先不提交：等协调者在本代所有通过者里选最好的一个
                                            (list k label rs r reason))))))))

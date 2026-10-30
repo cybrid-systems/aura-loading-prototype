@@ -16,7 +16,8 @@
     (define (out! s) (set! lines (cons s lines)))
     (out! (format "## ~a" order))
     (out! (format "- 采用：**~a** Agent 方案" (hget h "winner" "无")))
-    (let ((a (assoc (hget h "winner" "") agents))) (if a (out! (format "  - 构造思路：~a" (caddr a))) #f))
+    (let ((a (assoc (hget h "winner" "") all-agents))) (if a (out! (format "  - 构造思路：~a" (caddr a))) #f))
+    (for-each (lambda (d) (out! (format "- 派发：~a" d))) (hget h "dispatch" (list)))
     (for-each (lambda (s) (let ((p (car s)) (m (hget (cadr (car s)) "metrics" #f)))
                             (out! (format "- ~a：评分 ~a，柜 ~a（~a），相对运费 ~a，体积利用率 ~a%"
                                           (car p) (r3 (cadr s)) (hget m "containers" "?") (hget m "mix" "?")

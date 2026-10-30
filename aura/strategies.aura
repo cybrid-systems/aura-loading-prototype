@@ -17,6 +17,15 @@
     (heuristic same-spec  same  0.5 "同规格成墙：优先在同规格箱子上继续码")
     (heuristic heavy-low  heavy 0.3 "重货在下")
     (heuristic fit-gap    waste 0.0 "选能把剩余高度/宽度拼满的箱规")
+    ;; 专家 Agent：默认不跑，只有派发规则命中时替换掉某个默认 Agent（Agent 总数不变 = 算力不变）
+    (specialist fitgap   "拼缝"     wall   ((vol 1.0) (waste 1.0))        "优先选能把剩余高度/宽度拼满的箱规（箱规种类多时有效）")
+    (specialist mixed    "混规格柱" wall   ((vol 1.0) (yz 0.5) (mixed 1)) "底面相同、高度不同的两种箱叠成一柱，填满柜高")
+    (specialist oversize "大件"     corner ((vol 0.5) (big 2.0) (heavy 0.5)) "大件、重件先占柜角")
+    (specialist cog      "重心"     layer  ((vol 0.5) (xy 0.5) (heavy 1.5)) "重货铺底层，压低重心")
+    ;; (dispatch 特征 比较 阈值 被替换的 Agent 替换成的专家 "说明")；特征：types 箱规种数，fill 货物体积/45HC 容积，
+    ;; oversize 最长边 >1.2 m 的货物体积占比，stops 卸货站数。PC_DISPATCH=0 关闭派发
+    (dispatch types    >= 40  block fitgap "箱规 ≥ 40 种：剩余空间难拼满，拼缝 Agent 替换块式")
+    (dispatch fill     >  1.0 layer mixed  "货量超过一个 45HC（多柜）：混规格柱 Agent 替换层式")
     (knob depth   0 "墙深：0 = 单层切片与最大深度都试，1 = 只单层切片，2 = 只最大深度")
     (knob squeeze 0 "软包装压缩容差（比例）。>0 时结果单列，不算刚性结果")
     (knob anyrot  0 "允许纸箱侧放/倒放（数据里没有可倒置字段，默认只能直立）")))
@@ -32,7 +41,7 @@
 (define (space->param s) (cond ((eq? s 'layer) "space=1") ((eq? s 'corner) "space=2") (else "space=0")))
 (define (weight->param w v)
   (let ((k (cond ((eq? w 'vol) "w_vol") ((eq? w 'fill) "w_fill") ((eq? w 'yz) "w_yz") ((eq? w 'xy) "w_xy")
-                 ((eq? w 'big) "w_big") ((eq? w 'heavy) "w_heavy") ((eq? w 'same) "w_same") ((eq? w 'waste) "w_waste") (else #f))))
+                 ((eq? w 'big) "w_big") ((eq? w 'heavy) "w_heavy") ((eq? w 'same) "w_same") ((eq? w 'waste) "w_waste") ((eq? w 'mixed) "mixed") (else #f))))
     (if k (format "~a=~a" k v) "")))
 
 ;; 一个构造器 -> 内核参数串。human 构造器额外带上所有 heuristic 规则的权重
@@ -64,3 +73,50 @@
 (define (with-constructor-space rs name sp)
   (map (lambda (r) (if (and (eq? (srule-kind r) 'constructor) (eq? (srule-name r) name))
                        (list 'constructor name (list-ref r 2) sp (list-ref r 4) (list-ref r 5)) r)) rs))
+
+;; ---- 按问题特征派发 Agent ----
+(define (split-on s ch)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (start 0) (acc (list)))
+      (cond ((= i n) (reverse (if (> i start) (cons (substring s start i) acc) acc)))
+            ((char=? (string-ref s i) ch) (loop (+ i 1) (+ i 1) (if (> i start) (cons (substring s start i) acc) acc)))
+            (else (loop (+ i 1) start acc))))))
+;; 读问题文件算特征：((types n) (fill x) (oversize x) (stops n))
+(define (problem-features path)
+  (let* ((ls (split-on (read-file path) #\newline))
+         (toks (map (lambda (l) (split-on l #\space)) ls))
+         (I (filter (lambda (t) (and (pair? t) (equal? (car t) "I"))) toks))
+         (C (filter (lambda (t) (and (pair? t) (equal? (car t) "C"))) toks))
+         (num (lambda (t k) (string->number (list-ref t k))))
+         (hc (let ((x (filter (lambda (t) (equal? (cadr t) "45HC")) C))) (if (null? x) (if (null? C) #f (car C)) (car x))))
+         (cap (if hc (/ (* (num hc 2) (num hc 3) (num hc 4)) 1e9) 1.0))
+         (vol-of (lambda (t) (/ (* (num t 3) (num t 4) (num t 5) (num t 7)) 1e9)))
+         (V (foldl (lambda (a t) (+ a (vol-of t))) 0 I))
+         (big (foldl (lambda (a t) (if (> (max (num t 3) (num t 4) (num t 5)) 1200) (+ a (vol-of t)) a)) 0 I))
+         (stops (let loop ((xs I) (seen (list))) (if (null? xs) (length seen)
+                                                   (loop (cdr xs) (if (member (list-ref (car xs) 11) seen) seen (cons (list-ref (car xs) 11) seen)))))))
+    (list (list 'types (length I)) (list 'fill (if (> cap 0) (/ V cap) 0)) (list 'oversize (if (> V 0) (/ big V) 0)) (list 'stops stops))))
+
+(define (feature-hit? feats d)
+  (let ((v (cadr (or (assq (list-ref d 1) feats) (list 'x 0)))) (op (list-ref d 2)) (th (list-ref d 3)))
+    (cond ((eq? op '>=) (>= v th)) ((eq? op '>) (> v th)) ((eq? op '<=) (<= v th)) ((eq? op '<) (< v th)) (else #f))))
+
+;; 返回 (agents . 命中的派发规则说明)；agents 的格式同 strategy-agents
+(define (dispatch-agents rs path on?)
+  (let* ((feats (if on? (problem-features path) (list)))
+         (hits (if on? (filter (lambda (d) (feature-hit? feats d)) (strategy-of 'dispatch rs)) (list)))
+         (cs (map (lambda (c)
+                    (let ((h (filter (lambda (d) (eq? (list-ref d 4) (srule-name c))) hits)))
+                      (if (null? h) c
+                          (let ((sp (find-srule rs 'specialist (list-ref (car h) 5))))
+                            (if sp sp c)))))
+                  (strategy-of 'constructor rs))))
+    (cons (strategy-agents-of rs cs) (map (lambda (d) (list-ref d 6)) hits))))
+
+(define (strategy-agents-of rs cs)
+  (map (lambda (c) (list (list-ref c 2) (constructor->params rs c)
+                         (if (eq? (list-ref c 1) 'human)
+                             (string-append (list-ref c 5) (join-strings (map (lambda (h) (format "~a(~a=~a)" (list-ref h 4) (list-ref h 2) (list-ref h 3)))
+                                                                              (strategy-of 'heuristic rs)) "；"))
+                             (list-ref c 5))))
+       cs))

@@ -19,6 +19,7 @@
 ;; 留出集：初始 vs 演化后的人工经验构造器（训练时没见过）
 (define holdout (split-ws (env-or "PC_HOLDOUT" "")))
 (define (hold rs tag) (let ((pre (format "~a/hold-~a" out-dir tag))) (await-file (fill-launch (human-params rs) holdout pre)) (fill-result pre)))
+(let ((he (env-or "PC_HOLD_EXTRA" #f))) (if he (set! *tune-extra* he) #f))  ;; 留出集可以用另一种评估方式（例如真实 2 s 搜索）
 (define hb (if (null? holdout) #f (hold start-strategies "before")))
 (define ha (if (null? holdout) #f (hold (cadr result) "after")))
 (write-file (string-append out-dir "/tune-summary.txt")

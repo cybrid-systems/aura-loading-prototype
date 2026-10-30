@@ -13,6 +13,9 @@
 (define *strategies*
   (let ((f (env-or "PC_STRATEGIES" #f))) (if f (read-from-string (read-file f)) strategy-rules)))
 (define agents (strategy-agents *strategies*))
+;; 全部 Agent（默认 + 专家），解释报告查说明用
+(define all-agents (strategy-agents-of *strategies* (append (strategy-of 'constructor *strategies*) (strategy-of 'specialist *strategies*))))
+(define *dispatch* (not (equal? (env-or "PC_DISPATCH" "1") "0")))
 ;; 额外内核参数（例如单柜装满测试 "only=45HC maxbins=1"）
 (define *extra* (env-or "PC_EXTRA" ""))
 
@@ -57,7 +60,9 @@
 
 ;; 一个订单的完整决策。返回 hash：winner / plan / score / proposals / rejected / statuses / audit
 (define (decide problem out-prefix rs)
-  (let* ((res (channel:create 16)) (fin (channel:create 16)) (rargs (rules->kernel-args rs))
+  (let* ((disp (dispatch-agents *strategies* problem *dispatch*))
+         (agents (car disp))
+         (res (channel:create 16)) (fin (channel:create 16)) (rargs (rules->kernel-args rs))
          (n (length agents))
          (verdicts (map (lambda (a) (channel:create 1)) agents))
          (fs (map (lambda (k)
@@ -99,6 +104,7 @@
       (hash-set! h "scored" scored)
       (hash-set! h "rejected" (map (lambda (p) (list (car p) (if (cadr p) (check-plan rs (cadr p)) (list "内核无输出")))) rejected))
       (hash-set! h "statuses" statuses)
+      (hash-set! h "dispatch" (cdr disp))
       (hash-set! h "global-before" seen-before)
       (hash-set! h "global-after" (safe (lambda () chosen-plan) "unbound"))
       h)))
