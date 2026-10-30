@@ -112,9 +112,9 @@ python3 tools/bench.py --orders out/real --out out/bench-real --aura
 
 | 问题 | 绕过 | issue |
 |---|---|---|
-| 多个 fiber 并发 `json-parse` → glibc double free（SIGABRT），与 overlay/GC 无关 | 所有 `json-parse` 放到主 fiber 串行 | aura#ISSUE_JSON |
-| 局部变量与原语同名（`log`、`sqrt`）时 `(set! x (cons v x))` 右值解析成全局原语，得到 `(1 . <unknown>)` | 避免与原语同名的局部名 | aura#ISSUE_SET |
-| fiber lambda 捕获的外层变量需在 lambda 内重新 `let` 绑定（已知问题 #4781） | `spawn-reporting` 模式 | #4781 |
+| 多个 fiber 并发 `json-parse` → glibc double free（SIGABRT），与 overlay/GC 无关 | 所有 `json-parse` 放到主 fiber 串行 | [aura#4788](https://github.com/cybrid-systems/aura/issues/4788) |
+| 局部变量与原语同名（`log`、`sqrt`）时 `(set! x (cons v x))` 右值解析成全局原语，得到 `(1 . <unknown>)` | 避免与原语同名的局部名 | [aura#4789](https://github.com/cybrid-systems/aura/issues/4789) |
+| fiber lambda 捕获的外层变量需在 lambda 内重新 `let` 绑定（已知问题 #4781） | `spawn-reporting` 模式 | [aura#4781](https://github.com/cybrid-systems/aura/issues/4781) |
 | `shell` 原语只能通过 `(require "std/process" all:)` 的 `sh` 使用，只返回退出码 | 结果走文件 | — |
 | 管道下 stdout 块缓冲，超时被杀时输出全丢 | `script -qc` | — |
 
