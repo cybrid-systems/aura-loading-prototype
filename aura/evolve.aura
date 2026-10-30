@@ -8,7 +8,7 @@
 ;; 门禁通过（无违例、总运费不升、满足反馈要求）才 overlay-commit，否则 overlay-rollback。每步写审计行。
 
 (define active-rules default-rules)
-(define active-params "sort=0 w_x=1.0 w_z=0.15 w_y=0.02 iters=150")
+(define active-params "algo=block space=0 w_vol=1.0 w_yz=0.5")
 
 (define (read-feedback path)
   (let ((h (hash)) (txt (read-file path)))
@@ -60,9 +60,9 @@
     (if (> (hget fb "door_overload" 0) 0)
         (list (list "反馈:门端超载→端部载荷 18000→15000" 'rules (lambda () (with-rule active-rules 'check 'end-load (list 15000 "单端载荷 ≤ 15000kg（由超载反馈演化）")))))
         (list))
-    (list (list "参数:按底面积排序" 'params (lambda () "sort=1 w_x=1.0 w_z=0.15 w_y=0.02 iters=150"))
-          (list "参数:按高度排序 + 更重视低层" 'params (lambda () "sort=3 w_x=1.0 w_z=0.40 w_y=0.02 iters=150"))
-          (list "参数:不分站排序(应被门禁拒绝或无收益)" 'params (lambda () "sort=0 sort_stop=0 w_x=1.0 w_z=0.15 iters=150"))
+    (list (list "参数:换层式构造" 'params (lambda () "algo=block space=1 w_vol=0.5 w_xy=1.0"))
+          (list "参数:换块式构造" 'params (lambda () "algo=block space=2 w_vol=1.0"))
+          (list "参数:墙深只取最大深度" 'params (lambda () "algo=block space=0 w_vol=1.0 w_yz=0.5 depth=2"))
           (list "规则:关闭先卸后装(有害但合法，应被门禁拒绝)" 'rules (lambda () (with-rule active-rules 'hard 'lifo (list 0 "关闭先卸后装")))))))
 
 ;; 门禁：安全规则不允许被放松；违例数不升；总运费不升

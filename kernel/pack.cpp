@@ -1,4 +1,7 @@
-// aura-loading-prototype: 3D container loading kernel (extreme points + randomized local search).
+// aura-loading-prototype: 3D container loading kernel.
+//   algo=ep    extreme points + randomized local search over loading order (first version)
+//   algo=block block building on maximal spaces + greedy lookahead (kernel/blocks.hpp): wall / layer / corner
+//              constructors and block ranking weights are parameters, so each strategy is a rule in aura/
 // Input: line-based problem file (see docs/FORMAT.md). Output: result JSON + "@@m" metric line on stdout.
 // Coordinates (mm): x = length (0 = front wall, L = door), y = width, z = height.
 #include <algorithm>
@@ -37,6 +40,7 @@ struct Params {
 };
 
 static std::vector<CType> CT; static std::vector<Item> IT; static Params P;
+struct Sol;
 
 static bool overlap1(double a0, double a1, double b0, double b1) { return a0 < b1 - 1e-6 && b0 < a1 - 1e-6; }
 
@@ -140,6 +144,8 @@ static bool place(Bin& b, int ii, int seq) {
 
 struct Sol { std::vector<Bin> bins; std::vector<int> unplaced; double cost = 0; double score = 0; };
 
+#include "blocks.hpp"
+
 static Bin fill(int ct, const std::vector<int>& order, std::vector<char>& used, int& seq) {
   Bin b; b.ctype = ct; b.eps.push_back({0, 0, 0});
   for (int ii : order) if (!used[ii] && place(b, ii, seq)) { used[ii] = 1; ++seq; }
@@ -224,9 +230,16 @@ int main(int argc, char** argv) {
 
   auto t0 = std::chrono::steady_clock::now();
   auto elapsed = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); };
-  std::vector<int> order = initial_order(); Sol best = build(order); std::vector<int> bo = order;
-  std::mt19937 rng(P.seed); int it = 0, improved = 0;
-  for (; it < P.iters && elapsed() < P.time_ms; ++it) {  // local search over loading order
+  std::string algo = kv.count("algo") ? kv["algo"] : "ep";
+  I("space", BP.space); D("w_vol", BP.w_vol); D("w_fill", BP.w_fill); D("w_yz", BP.w_yz); D("w_xy", BP.w_xy); D("w_big", BP.w_big);
+  D("w_heavy", BP.w_heavy); D("w_waste", BP.w_waste); D("w_same", BP.w_same); I("depth", BP.depth); I("width", BP.width); I("maxw", BP.maxw);
+  D("squeeze", BP.squeeze); B("anyrot", BP.anyrot); I("maxbins", BP.maxbins); D("noise", BP.noise); I("rwidth", BP.rwidth);
+  if (algo != "block" && (BP.squeeze > 0 || BP.anyrot)) { std::fprintf(stderr, "squeeze/anyrot need algo=block\n"); return 2; }
+  Sol best; int it = 0, improved = 0;
+  if (algo == "block") { best = block_solve(P.time_ms, elapsed, &it); }
+  std::vector<int> order = initial_order(); if (algo != "block") best = build(order); std::vector<int> bo = order;
+  std::mt19937 rng(P.seed);
+  for (; algo != "block" && it < P.iters && elapsed() < P.time_ms; ++it) {  // local search over loading order
     std::vector<int> o = bo; int n = (int)o.size(); int moves = 1 + rng() % 3;
     for (int m = 0; m < moves; ++m) {
       int a = rng() % n, len = 1 + rng() % std::max(1, n / 10), b = rng() % n;
@@ -289,9 +302,10 @@ int main(int argc, char** argv) {
   js << "],\"metrics\":{\"boxes\":" << IT.size() << ",\"containers\":" << best.bins.size() << ",\"mix\":\"" << mixs << "\",\"cost\":" << best.cost
      << ",\"vol_util\":" << (tc > 0 ? tv / tc : 0) << ",\"wt_util\":" << (tcap > 0 ? tkg / tcap : 0) << ",\"unplaced\":" << best.unplaced.size()
      << ",\"cog_violations\":" << cog_viol << ",\"worst_cog_x\":" << worst_cx << ",\"worst_cog_y\":" << worst_cy << ",\"lower_bound\":" << lb
-     << ",\"iters\":" << it << ",\"improved\":" << improved << ",\"ms\":" << elapsed() << "}}\n";
+     << ",\"iters\":" << it << ",\"improved\":" << improved << ",\"algo\":\"" << algo << "\",\"squeeze\":" << BP.squeeze
+     << ",\"anyrot\":" << (BP.anyrot ? "true" : "false") << ",\"ms\":" << elapsed() << "}}\n";
   if (!out.empty()) { std::ofstream o(out); o << js.str(); }
-  std::printf("@@m containers=%zu mix=%s cost=%.2f vol_util=%.4f wt_util=%.4f unplaced=%zu cog_violations=%.0f worst_cog_x=%.4f worst_cog_y=%.4f lower_bound=%d iters=%d ms=%.0f\n",
-              best.bins.size(), mixs.c_str(), best.cost, tc > 0 ? tv / tc : 0, tcap > 0 ? tkg / tcap : 0, best.unplaced.size(), cog_viol, worst_cx, worst_cy, lb, it, elapsed());
+  std::printf("@@m containers=%zu mix=%s cost=%.2f vol_util=%.4f wt_util=%.4f unplaced=%zu cog_violations=%.0f worst_cog_x=%.4f worst_cog_y=%.4f lower_bound=%d iters=%d algo=%s squeeze=%g anyrot=%d ms=%.0f\n",
+              best.bins.size(), mixs.c_str(), best.cost, tc > 0 ? tv / tc : 0, tcap > 0 ? tkg / tcap : 0, best.unplaced.size(), cog_viol, worst_cx, worst_cy, lb, it, algo.c_str(), BP.squeeze, (int)BP.anyrot, elapsed());
   return best.unplaced.empty() ? 0 : 3;
 }

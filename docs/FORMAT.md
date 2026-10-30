@@ -30,6 +30,28 @@ R <键> <值>
 | `iters` / `time_ms` / `seed` | 局部搜索（随机扰动装载顺序）的迭代数、时间上限、随机种子 | |
 | `cog_x_lo/hi cog_y_lo/hi` | 重心允许范围（占柜长/柜宽的比例） | 0.30–0.70 / 0.40–0.60 |
 | `cog_shift` | 装完后把整体货物平移到柜中央（需要垫木/绑扎固定） | 1 |
+| `algo` | `ep` 极点启发式 + 局部搜索（旧内核）；`block` 块构造内核（`kernel/blocks.hpp`） | ep |
+
+`algo=block` 的参数（墙式 / 层式 / 块式 / 人工经验四种构造思路都是这组参数的不同取值，见 `aura/strategies.aura`）：
+
+| 参数 | 含义 | 默认 |
+|---|---|---|
+| `space` | 选空间的规则：0 墙式（先 x 再 z 再 y，从柜底往门一面墙一面墙）；1 层式（先 z）；2 块式（离柜角最近，Parreño 距离） | 0 |
+| `w_vol` | 块体积 / 本步最大候选块体积 | 1.0 |
+| `w_fill` | 块体积 / 所在空间体积 | 0 |
+| `w_yz` / `w_xy` | 横截面覆盖率（墙）/ 底面覆盖率（层） | 0 |
+| `w_big` | 大箱先装、大箱打底 | 0 |
+| `w_heavy` | 密度大的箱子放低 | 0 |
+| `w_waste` | 放块后 y/z 方向剩余空隙能被其他箱规填满的程度（一维背包，10 mm 栅格） | 0 |
+| `w_same` | 与下方/旁边同规格（同规格成墙） | 0 |
+| `depth` | 墙深（x 方向箱数）取法：0 背包 + 最大；1 只取一层；2 只取最大 | 0 |
+| `width` | 前瞻宽度：0 = 逐步加宽直到时间用完（饱和后转随机重启）；>0 = 固定宽度、单轮、确定性 | 0 |
+| `noise` / `rwidth` | 随机重启的评分扰动幅度 / 前瞻宽度 | 0.15 / 4 |
+| `maxbins` | >0 时最多用这么多柜，剩下的记为未装（单柜最大装载率评估用） | 0 |
+| `squeeze` | **软纸箱压缩容差**（每个尺寸按 1−squeeze 计）。不是刚性结果，metrics 里单独标 `squeeze` | 0 |
+| `anyrot` | 把"只能直立"当作可任意放倒（数据没有可倒置字段时的假设）。同样在 metrics 里单独标出 | 0 |
+
+`squeeze` / `anyrot` 只在 `algo=block` 下可用；`metrics.vol_util` 始终按**名义尺寸**计算，所以压缩结果与刚性结果的装载率可直接比较，但不能混为一谈。
 
 ## 输出 JSON
 
@@ -39,7 +61,7 @@ R <键> <值>
                     "boxes":[{"id","sku","x","y","z","dx","dy","dz","kg","stop","fragile","hazmat","seq"}] } ],
   "unplaced": [...],
   "metrics": { "boxes","containers","mix","cost","vol_util","wt_util","unplaced",
-               "cog_violations","worst_cog_x","worst_cog_y","lower_bound","iters","improved","ms" } }
+               "cog_violations","worst_cog_x","worst_cog_y","lower_bound","iters","improved","algo","squeeze","anyrot","ms" } }
 ```
 
 stdout 另输出一行 `@@m key=value ...`；有货未装入时退出码为 3。`tools/verify.py` 独立检查越界、重叠、超重、支撑率、先卸后装与漏装。

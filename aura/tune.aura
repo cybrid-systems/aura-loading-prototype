@@ -1,0 +1,101 @@
+;; aura/tune.aura — 人工经验规则的演化：让 human 构造器的装载率往人工水平（及以上）靠
+;;
+;; 每一代：从当前已提交的策略规则（active-strategies）生成一批候选变更（调某条 heuristic 的权重、换空间规则、
+;; 以及两个"有害但合法"的变更：压缩容差、允许倒放），每个候选在独立 fiber 的 COW overlay 里暂存
+;; （overlay-define "active-strategies"），用训练柜单批量回放（单柜装满模式，固定搜索宽度，结果可复现）。
+;; 门禁：刚性底线不可放松（squeeze=0、anyrot=0）、所有方案必须过独立校验 tools/verify.py、重心违例不升、
+;; 装载率必须提升。本代最好的通过者 overlay-commit，其余 overlay-rollback，每个候选写一行审计。
+
+(define active-strategies *strategies*)
+(define *tune-extra* (env-or "PC_TUNE_EXTRA" "only=45HC maxbins=1 width=4 noise=0 time_ms=600000"))
+(define *tune-par* (string->number (env-or "PC_TUNE_PAR" "4")))   ;; 同时回放的候选数（每个候选一个后台进程串行跑训练集）
+
+(define (human-params rs) (constructor->params rs (find-srule rs 'constructor 'human)))
+
+;; 回放：一个后台 shell 任务串行跑完所有订单，汇总 装载率之和 / 重心违例数 / 校验失败数 到一个文件
+(define (fill-launch params orders pre)
+  (let ((done (string-append pre ".done")))
+    (sh (string-append "rm -f " done))
+    (sh (string-append "( n=0; for o in " (join-strings orders " ") "; do n=$((n+1)); "
+                       *kernel* " --in $o --out " pre "-$n.json " params " " *tune-extra* " > " pre "-$n.log 2>&1; "
+                       "python3 tools/verify.py " pre "-$n.json 0.75 | grep -v '^unplaced=' | grep -qv '^OK$' && echo bad >> " pre ".bad; done; "
+                       "cat " pre "-*.log | grep -o 'vol_util=[0-9.]*' | awk -F= '{s+=$2} END{printf \"%.5f\", s}' > " pre ".util; "
+                       "cat " pre "-*.log | grep -o 'cog_violations=[0-9]*' | awk -F= '{s+=$2} END{printf \"%d\", s}' > " pre ".cog; "
+                       "touch " pre ".bad; echo ok > " done " ) &"))
+    done))
+(define (num-file f) (let ((v (read-file f))) (if (and (string? v) (> (string-length (string-trim v)) 0)) (string->number (string-trim v)) 0)))
+(define (fill-result pre)
+  (list (num-file (string-append pre ".util")) (num-file (string-append pre ".cog"))
+        (length (filter (lambda (l) (> (string-length l) 0)) (split-lines (let ((b (read-file (string-append pre ".bad")))) (if (string? b) b "")))))))
+
+(define (tune-floor-ok? rs) (and (= (knob rs 'squeeze 0) 0) (= (knob rs 'anyrot 0) 0)))
+
+;; 候选：基于当前 active-strategies 生成
+(define (tune-candidates rs)
+  (append
+    (apply append
+      (map (lambda (h)
+             (let ((n (srule-name h)) (v (list-ref h 3)))
+               (append (list (list (format "经验 ~a 权重 ~a→~a" n v (r3 (+ (* v 1.6) 0.2))) (with-heuristic rs n (r3 (+ (* v 1.6) 0.2)))))
+                       (if (> v 0) (list (list (format "经验 ~a 权重 ~a→~a" n v (r3 (* v 0.4))) (with-heuristic rs n (r3 (* v 0.4))))) (list)))))
+           (strategy-of 'heuristic rs)))
+    (list (list "人工经验构造器 空间规则→layer" (with-constructor-space rs 'human 'layer))
+          (list "人工经验构造器 空间规则→corner" (with-constructor-space rs 'human 'corner))
+          (list "开关 压缩容差 0→0.02（有害但合法：装载率会升，但不再是刚性尺寸）" (with-knob rs 'squeeze 0.02))
+          (list "开关 允许倒放 0→1（有害但合法：数据里没有可倒置字段）" (with-knob rs 'anyrot 1)))))
+
+(define (chunks xs n)
+  (if (null? xs) (list)
+      (let loop ((i 0) (a (list)) (r xs))
+        (if (or (= i n) (null? r)) (cons (reverse a) (chunks r n)) (loop (+ i 1) (cons (car r) a) (cdr r))))))
+
+(define (tune orders gens audit-path)
+  (let* ((pre0 (format "~a/tune-base" out-dir))
+         (_ (await-file (fill-launch (human-params active-strategies) orders pre0)))
+         (base (fill-result pre0)) (audit (list)) (step 0))
+    (define (audit! s) (set! audit (cons s audit)))
+    (audit! "gen\tstep\tchange\tutil_before\tutil_after\tcog_before\tcog_after\tinfeasible\tdecision\treason")
+    (let gen-loop ((g 1))
+      (if (> g gens) #f
+        (let* ((cands (tune-candidates active-strategies)) (res (channel:create 64)) (outs (list)))
+          ;; 每个候选一个 fiber + 自己的 overlay；分批并行，避免同时起太多内核进程
+          (for-each
+            (lambda (batch)
+              (let ((fs (map (lambda (c)
+                               (set! step (+ step 1))
+                               (let ((label (car c)) (rs (cadr c)) (k step))
+                                 (spawn-reporting res label
+                                   (lambda ()
+                                     (let ((label label) (rs rs) (k k) (g g) (orders orders) (base base) (res res))
+                                       (fiber:overlay-begin)
+                                       (fiber:overlay-define "active-strategies" rs)   ;; 只有这个 worldline 能看到
+                                       (let* ((pre (format "~a/tune-g~a-s~a" out-dir g k)))
+                                         (await-file (fill-launch (human-params rs) orders pre))
+                                         (let* ((r (fill-result pre))
+                                                (reason (cond ((not (tune-floor-ok? rs)) "放松了刚性底线（压缩/倒放）")
+                                                              ((> (caddr r) 0) "有方案没通过独立校验")
+                                                              ((> (cadr r) (cadr base)) "重心违例上升")
+                                                              ((<= (car r) (+ (car base) 0.0005)) "装载率没有提升")
+                                                              (else #f))))
+                                           ;; 先不提交：等协调者在本代所有通过者里选最好的一个
+                                           (list k label rs r reason))))))))
+                             batch)))
+                (for-each (lambda (f) (set! outs (cons (channel:recv res) outs))) fs)
+                (for-each fiber:join fs)))
+            (chunks cands *tune-par*))
+          (let* ((ok (filter (lambda (o) (and (pair? o) (not (list-ref o 4)))) outs))
+                 (best (if (null? ok) #f (foldl (lambda (b o) (if (> (car (list-ref o 3)) (car (list-ref b 3))) o b)) (car ok) (cdr ok)))))
+            (for-each
+              (lambda (o)
+                (if (pair? o)
+                    (let* ((r (list-ref o 3)) (win (and best (= (car o) (car best))))
+                           (dec (cond (win "KEEP") ((list-ref o 4) "ROLLBACK") (else "ROLLBACK"))))
+                      (audit! (format "~a\t~a\t~a\t~a\t~a\t~a\t~a\t~a\t~a\t~a" g (car o) (cadr o) (r3 (car base)) (r3 (car r)) (cadr base) (cadr r) (caddr r) dec
+                                      (cond (win "本代提升最大，提交") ((list-ref o 4) (list-ref o 4)) (else "有提升但不是本代最好")))))
+                    (audit! (format "~a\t-\t-\t-\t-\t-\t-\t-\tERROR\t~a" g o))))
+              (list-sort (lambda (a b) (< (if (pair? a) (car a) 0) (if (pair? b) (car b) 0))) outs))
+            (if best
+                (begin (set! active-strategies (list-ref best 2)) (set! base (list-ref best 3)) (gen-loop (+ g 1)))
+                (audit! (format "~a\t-\t本代没有候选通过门禁，停止\t~a\t-\t-\t-\t-\tSTOP\t-" g (r3 (car base)))))))))
+    (write-file audit-path (string-append (join-strings (reverse audit) "\n") "\n"))
+    (list base active-strategies)))

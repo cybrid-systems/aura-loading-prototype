@@ -1,0 +1,66 @@
+;; aura/strategies.aura — 装箱构造策略 EDSL：每个构造器、每条人工经验都是一条规则（数据），编译成 C++ 内核参数
+;;
+;;   (constructor 名称 显示名 空间规则 ((权重名 值) ...) "说明")
+;;       空间规则：wall = 从柜底往门（先 x 后 z），layer = 先铺满底层（先 z 后 x），corner = 离柜角最近（Parreño）
+;;   (heuristic 名称 权重名 值 "说明")   —— 人工经验，作为加到 human 构造器上的块评分权重；演化循环调的就是这些值
+;;   (knob 名称 值 "说明")               —— 其他内核开关；squeeze / anyrot 会改变问题本身，刚性结果必须为 0
+;;
+;; 权重名 -> 内核参数：vol=w_vol 块体积，fill=w_fill 占空间比例，yz=w_yz 横截面覆盖（成墙），xy=w_xy 底面覆盖（成层），
+;; big=w_big 大箱优先，heavy=w_heavy 重货在下，same=w_same 与下方同规格，waste=w_waste 剩余高/宽拼不满的浪费（越小越好）
+
+(define strategy-rules
+  '((constructor wall  "墙式"     wall   ((vol 1.0) (yz 0.5)) "从柜底往门一面墙一面墙地装，优先填满横截面")
+    (constructor layer "层式"     layer  ((vol 0.5) (xy 1.0)) "先铺满一层再往上，优先填满底面")
+    (constructor block "块式"     corner ((vol 1.0))          "同尺寸箱子拼成最大的块，放进离柜角最近的空间")
+    (constructor human "人工经验" wall   ((vol 0.3))          "按下面的人工经验规则装：")
+    (heuristic big-bottom big   1.0 "大箱打底、大箱先装")
+    (heuristic same-spec  same  0.5 "同规格成墙：优先在同规格箱子上继续码")
+    (heuristic heavy-low  heavy 0.3 "重货在下")
+    (heuristic fit-gap    waste 0.0 "选能把剩余高度/宽度拼满的箱规")
+    (knob depth   0 "墙深：0 = 单层切片与最大深度都试，1 = 只单层切片，2 = 只最大深度")
+    (knob squeeze 0 "软包装压缩容差（比例）。>0 时结果单列，不算刚性结果")
+    (knob anyrot  0 "允许纸箱侧放/倒放（数据里没有可倒置字段，默认只能直立）")))
+
+(define (srule-kind r) (car r))
+(define (srule-name r) (cadr r))
+(define (strategy-of kind rs) (filter (lambda (r) (eq? (srule-kind r) kind)) rs))
+(define (find-srule rs kind name)
+  (let loop ((xs rs)) (cond ((null? xs) #f)
+                            ((and (eq? (srule-kind (car xs)) kind) (eq? (srule-name (car xs)) name)) (car xs))
+                            (else (loop (cdr xs))))))
+(define (knob rs name dflt) (let ((r (find-srule rs 'knob name))) (if r (list-ref r 2) dflt)))
+(define (space->param s) (cond ((eq? s 'layer) "space=1") ((eq? s 'corner) "space=2") (else "space=0")))
+(define (weight->param w v)
+  (let ((k (cond ((eq? w 'vol) "w_vol") ((eq? w 'fill) "w_fill") ((eq? w 'yz) "w_yz") ((eq? w 'xy) "w_xy")
+                 ((eq? w 'big) "w_big") ((eq? w 'heavy) "w_heavy") ((eq? w 'same) "w_same") ((eq? w 'waste) "w_waste") (else #f))))
+    (if k (format "~a=~a" k v) "")))
+
+;; 一个构造器 -> 内核参数串。human 构造器额外带上所有 heuristic 规则的权重
+(define (constructor->params rs c)
+  (let* ((name (list-ref c 1)) (space (list-ref c 3)) (ws (list-ref c 4))
+         (hs (if (eq? name 'human) (map (lambda (h) (list (list-ref h 2) (list-ref h 3))) (strategy-of 'heuristic rs)) (list)))
+         ;; 不在 ws 里的 vol 权重默认 0
+         (all (append ws hs)))
+    (join-strings
+      (append (list "algo=block" (space->param space))
+              (if (assq 'vol all) (list) (list "w_vol=0"))
+              (map (lambda (p) (weight->param (car p) (cadr p))) all)
+              (list (format "depth=~a squeeze=~a anyrot=~a" (knob rs 'depth 0) (knob rs 'squeeze 0) (knob rs 'anyrot 0))))
+      " ")))
+
+;; 规则集 -> Agent 列表 ((显示名 参数串 说明) ...)
+(define (strategy-agents rs)
+  (map (lambda (c) (list (list-ref c 2) (constructor->params rs c)
+                         (if (eq? (list-ref c 1) 'human)
+                             (string-append (list-ref c 5) (join-strings (map (lambda (h) (format "~a(~a=~a)" (list-ref h 4) (list-ref h 2) (list-ref h 3)))
+                                                                              (strategy-of 'heuristic rs)) "；"))
+                             (list-ref c 5))))
+       (strategy-of 'constructor rs)))
+
+(define (with-heuristic rs name v)
+  (map (lambda (r) (if (and (eq? (srule-kind r) 'heuristic) (eq? (srule-name r) name)) (list 'heuristic name (list-ref r 2) v (list-ref r 4)) r)) rs))
+(define (with-knob rs name v)
+  (map (lambda (r) (if (and (eq? (srule-kind r) 'knob) (eq? (srule-name r) name)) (list 'knob name v (list-ref r 3)) r)) rs))
+(define (with-constructor-space rs name sp)
+  (map (lambda (r) (if (and (eq? (srule-kind r) 'constructor) (eq? (srule-name r) name))
+                       (list 'constructor name (list-ref r 2) sp (list-ref r 4) (list-ref r 5)) r)) rs))
