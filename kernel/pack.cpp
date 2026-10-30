@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
+#include <set>
 #include <iostream>
 #include <map>
 #include <random>
@@ -233,7 +235,7 @@ int main(int argc, char** argv) {
   std::string algo = kv.count("algo") ? kv["algo"] : "ep";
   I("space", BP.space); D("w_vol", BP.w_vol); D("w_fill", BP.w_fill); D("w_yz", BP.w_yz); D("w_xy", BP.w_xy); D("w_big", BP.w_big);
   D("w_heavy", BP.w_heavy); D("w_waste", BP.w_waste); D("w_same", BP.w_same); I("depth", BP.depth); I("width", BP.width); I("maxw", BP.maxw);
-  D("squeeze", BP.squeeze); B("anyrot", BP.anyrot); I("maxbins", BP.maxbins); D("noise", BP.noise); I("rwidth", BP.rwidth);
+  D("squeeze", BP.squeeze); B("anyrot", BP.anyrot); I("maxbins", BP.maxbins); I("mixed", BP.mixed); D("noise", BP.noise); I("rwidth", BP.rwidth);
   if (algo != "block" && (BP.squeeze > 0 || BP.anyrot)) { std::fprintf(stderr, "squeeze/anyrot need algo=block\n"); return 2; }
   Sol best; int it = 0, improved = 0;
   if (algo == "block") { best = block_solve(P.time_ms, elapsed, &it); }
@@ -295,17 +297,46 @@ int main(int argc, char** argv) {
   double maxv = 0, maxkg = 0; for (auto& c : CT) { maxv = std::max(maxv, c.L * c.W * c.H); maxkg = std::max(maxkg, c.max_kg); }
   double totkg = 0; for (auto& t : IT) totkg += t.kg;
   int lb = (int)std::ceil(std::max(pv / maxv, totkg / maxkg) - 1e-9);
+  // tighter bound: along any line parallel to an axis the boxes it crosses are disjoint, so the covered length is a sum of
+  // box extents <= the container extent.  kL/kW/kH = largest such sum (unbounded subset sum over all allowed extents,
+  // 1 mm grid), so packed volume <= min(kL*W*H, L*kW*H, L*W*kH).  Then a minimum-cost cover over container types.
+  auto ksum = [&](double cap, int axis) {
+    int n = (int)cap; std::vector<char> r(n + 1, 0); r[0] = 1; std::set<int> ext;
+    for (auto& it : IT) { std::vector<std::array<double,3>> o; orientations(it, o);
+      for (auto& d : o) { double e = d[axis] * (1 - BP.squeeze); ext.insert((int)std::ceil(e - 1e-6)); } }
+    if (BP.anyrot) { ext.clear(); for (auto& it : IT) for (double e : {it.l, it.w, it.h}) ext.insert((int)std::ceil(e * (1 - BP.squeeze) - 1e-6)); }
+    for (int e : ext) if (e > 0) for (int v = e; v <= n; ++v) if (r[v - e]) r[v] = 1;
+    for (int v = n; v >= 0; --v) if (r[v]) return (double)v;
+    return 0.0; };
+  std::vector<double> capE(CT.size());
+  for (size_t c = 0; c < CT.size(); ++c) {
+    const CType& t = CT[c]; double kl = ksum(t.L, 0), kw = ksum(t.W, 1), kh = ksum(t.H, 2);
+    capE[c] = std::min({kl * t.W * t.H, t.L * kw * t.H, t.L * t.W * kh});
+  }
+  double pvn = 0; for (auto& t : IT) pvn += t.l * t.w * t.h * std::pow(1 - BP.squeeze, 3);
+  double maxe = *std::max_element(capE.begin(), capE.end());
+  int lb2 = (int)std::ceil(std::max(pvn / maxe, totkg / maxkg) - 1e-9);
+  // min-cost cover: enumerate counts of each type (<= lb2 + 2 each), volume (effective) and weight must be covered
+  double lbc = 1e18; std::vector<int> n(CT.size(), 0); int lim = lb2 + 2;
+  std::function<void(size_t, double, double, double)> rec = [&](size_t i, double v, double kg, double cost) {
+    if (cost >= lbc) return;
+    if (v >= pvn - 1e-6 && kg >= totkg - 1e-6) { lbc = cost; return; }
+    if (i == CT.size()) return;
+    for (int k = 0; k <= lim; ++k) rec(i + 1, v + k * capE[i], kg + k * CT[i].max_kg, cost + k * CT[i].cost);
+  };
+  if (CT.size() <= 4) rec(0, 0, 0, 0);
   std::map<std::string, int> mix; for (auto& b : best.bins) mix[CT[b.ctype].name]++;
   std::string mixs; for (auto& [k, v] : mix) mixs += (mixs.empty() ? "" : "+") + std::to_string(v) + "x" + k;
   js << "],\"unplaced\":[";
   for (size_t k = 0; k < best.unplaced.size(); ++k) js << (k ? "," : "") << "\"" << jesc(IT[best.unplaced[k]].id) << "\"";
   js << "],\"metrics\":{\"boxes\":" << IT.size() << ",\"containers\":" << best.bins.size() << ",\"mix\":\"" << mixs << "\",\"cost\":" << best.cost
      << ",\"vol_util\":" << (tc > 0 ? tv / tc : 0) << ",\"wt_util\":" << (tcap > 0 ? tkg / tcap : 0) << ",\"unplaced\":" << best.unplaced.size()
-     << ",\"cog_violations\":" << cog_viol << ",\"worst_cog_x\":" << worst_cx << ",\"worst_cog_y\":" << worst_cy << ",\"lower_bound\":" << lb
+     << ",\"cog_violations\":" << cog_viol << ",\"worst_cog_x\":" << worst_cx << ",\"worst_cog_y\":" << worst_cy << ",\"lower_bound\":" << lb << ",\"lower_bound2\":" << lb2 << ",\"lb_cost\":" << (lbc < 1e17 ? lbc : 0)
+     << ",\"cost_gap\":" << (lbc < 1e17 && lbc > 0 ? best.cost / lbc - 1 : 0)
      << ",\"iters\":" << it << ",\"improved\":" << improved << ",\"algo\":\"" << algo << "\",\"squeeze\":" << BP.squeeze
      << ",\"anyrot\":" << (BP.anyrot ? "true" : "false") << ",\"ms\":" << elapsed() << "}}\n";
   if (!out.empty()) { std::ofstream o(out); o << js.str(); }
-  std::printf("@@m containers=%zu mix=%s cost=%.2f vol_util=%.4f wt_util=%.4f unplaced=%zu cog_violations=%.0f worst_cog_x=%.4f worst_cog_y=%.4f lower_bound=%d iters=%d algo=%s squeeze=%g anyrot=%d ms=%.0f\n",
-              best.bins.size(), mixs.c_str(), best.cost, tc > 0 ? tv / tc : 0, tcap > 0 ? tkg / tcap : 0, best.unplaced.size(), cog_viol, worst_cx, worst_cy, lb, it, algo.c_str(), BP.squeeze, (int)BP.anyrot, elapsed());
+  std::printf("@@m containers=%zu mix=%s cost=%.2f vol_util=%.4f wt_util=%.4f unplaced=%zu cog_violations=%.0f worst_cog_x=%.4f worst_cog_y=%.4f lower_bound=%d lower_bound2=%d lb_cost=%.2f iters=%d algo=%s squeeze=%g anyrot=%d ms=%.0f\n",
+              best.bins.size(), mixs.c_str(), best.cost, tc > 0 ? tv / tc : 0, tcap > 0 ? tkg / tcap : 0, best.unplaced.size(), cog_viol, worst_cx, worst_cy, lb, lb2, lbc < 1e17 ? lbc : 0, it, algo.c_str(), BP.squeeze, (int)BP.anyrot, elapsed());
   return best.unplaced.empty() ? 0 : 3;
 }

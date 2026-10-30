@@ -49,6 +49,7 @@ R <键> <值>
 | `noise` / `rwidth` | 随机重启的评分扰动幅度 / 前瞻宽度 | 0.15 / 4 |
 | `maxbins` | >0 时最多用这么多柜，剩下的记为未装（单柜最大装载率评估用） | 0 |
 | `squeeze` | **软纸箱压缩容差**（每个尺寸按 1−squeeze 计）。不是刚性结果，metrics 里单独标 `squeeze` | 0 |
+| `mixed` | 1 = 允许"混规格柱"：底面尺寸相同（±1 mm）、同卸货站的两种箱规上下叠成一个块（下层非易碎/非危险品，上层整列重量不超过下层顶部承重）。默认 0（实测基本持平，作为专家 Agent 使用） | 0 |
 | `anyrot` | 把"只能直立"当作可任意放倒（数据没有可倒置字段时的假设）。同样在 metrics 里单独标出 | 0 |
 
 `squeeze` / `anyrot` 只在 `algo=block` 下可用；`metrics.vol_util` 始终按**名义尺寸**计算，所以压缩结果与刚性结果的装载率可直接比较，但不能混为一谈。
@@ -61,7 +62,10 @@ R <键> <值>
                     "boxes":[{"id","sku","x","y","z","dx","dy","dz","kg","stop","fragile","hazmat","seq"}] } ],
   "unplaced": [...],
   "metrics": { "boxes","containers","mix","cost","vol_util","wt_util","unplaced",
-               "cog_violations","worst_cog_x","worst_cog_y","lower_bound","iters","improved","algo","squeeze","anyrot","ms" } }
+               "cog_violations","worst_cog_x","worst_cog_y","lower_bound","lower_bound2","lb_cost","cost_gap","iters","improved","algo","squeeze","anyrot","ms" } }
 ```
+
+- `lower_bound`：按体积/重量的柜数下界；`lower_bound2`：再按每个方向的箱尺寸子集和（一维背包）算出柜子"实际能用到"的长/宽/高后的更紧下界（严格成立）。
+- `lb_cost`：最便宜的柜型组合，使总容积 ≥ 货物体积、总限重 ≥ 货物重量（容积按 100% 计，严格成立）；`cost_gap = cost / lb_cost − 1` 是运费最优性间隙的上界（真实间隙只会更小）。
 
 stdout 另输出一行 `@@m key=value ...`；有货未装入时退出码为 3。`tools/verify.py` 独立检查越界、重叠、超重、支撑率、先卸后装与漏装。

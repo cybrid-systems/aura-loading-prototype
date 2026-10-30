@@ -31,6 +31,7 @@ struct BParams {
   double noise = 0.15;    // score noise of the randomized restarts after widening saturates (GRASP-style)
   int rwidth = 4;         // lookahead width of the randomized restarts
   int maxbins = 0;        // >0: stop after this many containers (rest reported unplaced; for single-container tests)
+  int mixed = 0;          // mixed-spec column blocks: type A stacked under type B with the same footprint (fills the height)
 };
 static BParams BP;
 
@@ -43,7 +44,7 @@ struct PBlock { int t, o, nx, ny, nz, first; double x, y, z, bx, by, bz, kg, loa
 struct BState {
   int ct = 0; std::vector<Space> sp; std::vector<PBlock> bl; std::vector<int> used; double vol = 0, kg = 0; int phase_stop = 1 << 30;
 };
-struct Cand { int t, o, nx, ny, nz; double score, vol; };
+struct Cand { int t, o, nx, ny, nz; double score, vol; int t2 = -1, o2 = 0, nz2 = 0; };  // t2 >= 0: mixed column, t2 stacked on t
 
 static bool ovl(double a0, double a1, double b0, double b1) { return a0 < b1 - 1e-6 && b0 < a1 - 1e-6; }
 
@@ -165,6 +166,34 @@ struct Engine {
     return true;
   }
 
+  // a mixed column = part A (k.t) at the space corner + part B (k.t2, same footprint) directly on top of it
+  static Cand partA(const Cand& k) { Cand a = k; a.t2 = -1; a.nz2 = 0; return a; }
+  static Cand partB(const Cand& k) { return Cand{k.t2, k.o2, k.nx, k.ny, k.nz2, 0, 0}; }
+  bool feasible_any(const BState& s, const Cand& k, double x, double y, double z, double* kgout) const {
+    if (k.t2 < 0) return feasible(s, k, x, y, z, kgout);
+    double ka, kb; Cand a = partA(k), b = partB(k);
+    if (!feasible(s, a, x, y, z, &ka)) return false;
+    // B rests fully on A (same footprint): check weight, A's top load, LIFO / hazmat for B's z range via feasible() on z above A
+    const BType& A = BT[a.t]; const BType& B = BT[b.t];
+    double kgB = B.pre[s.used[b.t] + b.nx * b.ny * b.nz] - B.pre[s.used[b.t]];
+    if (s.kg + ka + kgB > c->max_kg + 1e-6) return false;
+    double above_per_col = IT[B.items[s.used[b.t]]].kg * b.nz;  // heaviest B boxes, conservatively
+    if (above_per_col > A.max_top + 1e-6) return false;
+    if (multistop && P.lifo) {
+      const auto& oa = A.ors[a.o]; const auto& ob = B.ors[b.o];
+      double X1 = x + ob[0] * b.nx, Y1 = y + ob[1] * b.ny, Z0 = z + oa[2] * a.nz, Z1 = Z0 + ob[2] * b.nz;
+      for (auto& q : s.bl) {
+        if (!ovl(y, Y1, q.y, q.y + q.by * q.ny) || !ovl(Z0, Z1, q.z, q.z + q.bz * q.nz)) continue;
+        if (BT[q.t].stop > B.stop && q.x >= X1 - 1e-6) return false;
+        if (BT[q.t].stop < B.stop && q.x + q.bx * q.nx <= x + 1e-6) return false;
+      }
+    }
+    if (b.nz > 1 && IT[B.items[s.used[b.t]]].kg > B.max_top + 1e-6) return false;
+    (void)kb;
+    if (kgout) *kgout = ka + kgB;
+    return true;
+  }
+
   void candidates(const BState& s, const Space& p, std::vector<Cand>& out) const {
     out.clear(); double sx = p.x1 - p.x0, sy = p.y1 - p.y0, sz = p.z1 - p.z0, svol = sx * sy * sz;
     int maxstop = -1; if (multistop && P.lifo) for (size_t t = 0; t < BT.size(); ++t) if (rem(s, (int)t) > 0) maxstop = std::max(maxstop, BT[t].stop);
@@ -206,10 +235,62 @@ struct Engine {
         }
       }
     }
+    // mixed-spec columns: same footprint (dx, dy), A below B, heights chosen to fill the space height best
+    if (BP.mixed) {
+      size_t npure = out.size();
+      for (size_t ci = 0; ci < npure; ++ci) {
+        const Cand k = out[ci]; const BType& A = BT[k.t]; const auto& oa = A.ors[k.o];
+        if (A.fragile || A.max_top <= 0 || !A.hazmat.empty()) continue;
+        double hA = oa[2], fillA = k.nz * hA; if (sz - fillA < 1e-6) continue;
+        for (size_t u = 0; u < BT.size(); ++u) {
+          if ((int)u == k.t) continue;
+          int ru = rem(s, (int)u); if (ru <= 0) continue;
+          const BType& U = BT[u]; if (!U.hazmat.empty() || U.stop != A.stop) continue;
+          for (size_t ou = 0; ou < U.ors.size(); ++ou) {
+            const auto& ob = U.ors[ou]; if (std::fabs(ob[0] - oa[0]) > 1 || std::fabs(ob[1] - oa[1]) > 1) continue;
+            int cols = k.nx * k.ny; int maxA = std::min(k.nz, rem(s, k.t) / cols);
+            double bestf = fillA; int bA = 0, bB = 0;
+            for (int na = std::max(1, maxA - 3); na <= maxA; ++na) {
+              int nb = (int)((sz - na * hA + 1e-6) / ob[2]); nb = std::min(nb, ru / cols);
+              if (U.fragile || U.max_top <= 0) nb = std::min(nb, 1);
+              if (nb < 1) continue;
+              double f = na * hA + nb * ob[2];
+              if (f > bestf + 1e-6) { bestf = f; bA = na; bB = nb; }
+            }
+            if (!bA) continue;
+            Cand m{k.t, k.o, k.nx, k.ny, bA, 0, 0, (int)u, (int)ou, bB};
+            double bx = k.nx * oa[0], by = k.ny * oa[1], bz = bestf; m.vol = cols * (bA * A.vol + bB * U.vol);
+            double ly = sy - by, lz = sz - bz;
+            double waste = ((ly - knap_fill(ky, ly)) / c->W + (lz - knap_fill(kz, lz)) / c->H);
+            m.score = BP.w_vol * m.vol + BP.w_fill * m.vol / svol * 1e9 + BP.w_yz * (by * bz) / (sy * sz) * 1e9 + BP.w_xy * (bx * by) / (sx * sy) * 1e9
+                    + BP.w_big * A.vol / maxbig * 1e9 + BP.w_heavy * (maxden > 0 ? A.dens / maxden : 0) * (1 - p.z0 / c->H) * 1e9
+                    - BP.w_waste * waste * 1e9 + BP.w_same * (k.t == below ? 1e9 : 0);
+            if (noise > 0) m.score *= 1 + noise * (std::uniform_real_distribution<double>(-1, 1)(rng));
+            out.push_back(m);
+          }
+        }
+      }
+    }
     std::sort(out.begin(), out.end(), [](const Cand& a, const Cand& b) { return a.score > b.score; });
   }
 
   void place(BState& s, int si, const Cand& k, double kg) const {
+    if (k.t2 >= 0) {  // mixed column: A at the corner, then B in the space directly above A
+      const Space p = s.sp[si]; Cand a = partA(k), b = partB(k); const auto& oa = BT[a.t].ors[a.o]; const auto& ob = BT[b.t].ors[b.o];
+      a.vol = a.nx * a.ny * a.nz * BT[a.t].vol; b.vol = b.nx * b.ny * b.nz * BT[b.t].vol;
+      double ka = BT[a.t].pre[s.used[a.t] + a.nx * a.ny * a.nz] - BT[a.t].pre[s.used[a.t]];
+      place1(s, si, a, ka);
+      double zt = p.z0 + a.nz * oa[2], X1 = p.x0 + b.nx * ob[0], Y1 = p.y0 + b.ny * ob[1], Z1 = zt + b.nz * ob[2];
+      for (size_t j = 0; j < s.sp.size(); ++j) {
+        const Space& q = s.sp[j];
+        if (std::fabs(q.x0 - p.x0) < 1e-3 && std::fabs(q.y0 - p.y0) < 1e-3 && std::fabs(q.z0 - zt) < 1e-3 && q.x1 >= X1 - 1e-6 && q.y1 >= Y1 - 1e-6 && q.z1 >= Z1 - 1e-6) {
+          place1(s, (int)j, b, kg - ka); return; }
+      }
+      return;  // cannot happen (the split always leaves the space above A); B is simply not placed
+    }
+    place1(s, si, k, kg);
+  }
+  void place1(BState& s, int si, const Cand& k, double kg) const {
     const Space p = s.sp[si]; const auto& o = BT[k.t].ors[k.o];
     PBlock b{k.t, k.o, k.nx, k.ny, k.nz, s.used[k.t], p.x0, p.y0, p.z0, o[0], o[1], o[2], kg, 0};
     if (p.z0 > 1e-6 && anyload) {
@@ -246,7 +327,7 @@ struct Engine {
     std::vector<Cand> cs;
     while (!s.sp.empty()) {
       int si = pick_space(s); candidates(s, s.sp[si], cs); feas.clear(); kgs.clear();
-      for (auto& k : cs) { double kg; if (feasible(s, k, s.sp[si].x0, s.sp[si].y0, s.sp[si].z0, &kg)) { feas.push_back(k); kgs.push_back(kg); if ((int)feas.size() >= want) break; } }
+      for (auto& k : cs) { double kg; if (feasible_any(s, k, s.sp[si].x0, s.sp[si].y0, s.sp[si].z0, &kg)) { feas.push_back(k); kgs.push_back(kg); if ((int)feas.size() >= want) break; } }
       if (!feas.empty()) return si;
       s.sp.erase(s.sp.begin() + si);
     }
