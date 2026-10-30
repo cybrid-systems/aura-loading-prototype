@@ -87,4 +87,66 @@ if grep -q "压缩容差.*ROLLBACK.*刚性底线" out/test/tune/tune-audit.tsv &
 PC_STRATEGIES=out/test/tune/tuned-strategies.txt PC_RULES=aura/rules-fill.sexp PC_EXTRA="only=45HC maxbins=1" PC_TIME_MS=300 \
   PC_ORDERS="$(ls out/test/orders/*.txt | head -1)" PC_OUT=out/test/tuned script -qc "scripts/aura.sh aura/main.aura" /dev/null > out/test/tuned.log 2>&1 || true
 if grep -q "单柜评估" out/test/tuned/explain.md 2>/dev/null || grep -q "采用：\*\*[^#]" out/test/tuned/explain.md 2>/dev/null; then echo "ok   aura-load-tuned"; else echo "FAIL aura-load-tuned"; fail=1; fi
+# 8) consolidation known answer: shipments of 2,3,2,1 unit cubes into a 4-cube container.
+#    next-fit in arrival order needs 3 containers; the optimum (and the volume bound) is 2 = {2,2},{3,1}
+cat > out/test/cons.txt <<'P'
+C SLOT4 4000 1000 1000 10000 1 -1
+I a.1 a 1000 1000 1000 10 2 2 1e9 0 1 -
+I b.1 b 1000 1000 1000 10 3 2 1e9 0 1 -
+I c.1 c 1000 1000 1000 10 2 2 1e9 0 1 -
+I d.1 d 1000 1000 1000 10 1 2 1e9 0 1 -
+P
+rm -rf out/test/cons out/test/cons-work
+python3 tools/consolidate.py --pool out/test/cons.txt --name K --algo nf --base-type SLOT4 --max-fill 1 --out out/test/cons --work out/test/cons-work -j 2 >/dev/null
+python3 tools/consolidate.py --pool out/test/cons.txt --name K --algo lns --base-type SLOT4 --max-fill 1 --time-s 5 --search-ms 200 --out out/test/cons --work out/test/cons-work -j 2 >/dev/null
+python3 - <<'PY' && echo "ok   consolidate-known-answer" || { echo "FAIL consolidate-known-answer"; fail=1; }
+import json, sys; sys.path.insert(0, "tools"); from verify import check
+nf = json.load(open("out/test/cons/K.nf.json")); ln = json.load(open("out/test/cons/K.lns.json"))
+assert nf["metrics"]["containers"] == 3 and ln["metrics"]["containers"] == 2 and ln["metrics"]["gap"] == 0.0, (nf["metrics"], ln["metrics"])
+for c in ln["containers"]:
+    assert not check({"containers": [c], "unplaced": []}), c["shipments"]
+assert sorted(s for c in ln["containers"] for s in c["shipments"]) == ["0:a", "0:b", "0:c", "0:d"]
+PY
+# 8b) consolidation on a small synthetic route: LNS never worse than next-fit, every shipment exactly once
+python3 tools/gen_pool.py --routes 1 --seed 5 --scale 0.3 --out out/test/pool >/dev/null
+for al in nf lns; do python3 tools/consolidate.py --groups out/test/pool/pools.json --algo $al --time-s 8 --search-ms 300 --out out/test/pool-out --work out/test/pool-work -j "$J" >/dev/null; done
+python3 - <<'PY' && echo "ok   consolidate-synthetic" || { echo "FAIL consolidate-synthetic"; fail=1; }
+import json; nf = json.load(open("out/test/pool-out/R1.nf.json"))["metrics"]; ln = json.load(open("out/test/pool-out/R1.lns.json"))["metrics"]
+assert ln["cost"] <= nf["cost"] + 1e-9 and ln["cost"] >= ln["lb_cost"] - 1e-9, (nf, ln)
+PY
+# 9) PK harness: our own plan is executable; a plan with a missing box and a box laid on its side is not
+f=$(ls out/test/orders/*.txt | head -1); b=$(basename "$f" .txt); rm -rf out/test/pk; mkdir -p out/test/pk/bad
+python3 tools/pk.py --problems "$f" --ours-ms 300 --ours-dir out/test/pk/ours --json out/test/pk/a.json >/dev/null
+python3 - "$b" <<'PY'
+import json, sys; r = json.load(open(f"out/test/pk/ours/{sys.argv[1]}.json")); bs = r["containers"][0]["boxes"]; bs.pop()
+up = next(x for x in bs if x["dx"] != x["dz"]); up["dx"], up["dz"] = up["dz"], up["dx"]
+json.dump(r, open(f"out/test/pk/bad/{sys.argv[1]}.json", "w"))
+PY
+python3 tools/pk.py --problems "$f" --plans ours=out/test/pk/ours bad=out/test/pk/bad --json out/test/pk/b.json >/dev/null
+python3 - <<'PY' && echo "ok   pk-harness" || { echo "FAIL pk-harness"; fail=1; }
+import json; d = json.load(open("out/test/pk/b.json"))["detail"]
+assert d["ours"][0]["ok"], d["ours"][0]["errors"]
+e = " ".join(d["bad"][0]["errors"]) + " " + str(d["bad"][0]["n_errors"])
+assert not d["bad"][0]["ok"] and "placed" in json.dumps(d["bad"]) and ("upright" in json.dumps(d["bad"]) or "overlap" in e or "bounds" in e), d["bad"]
+PY
+# 10) feature-based agent dispatch: 40+ carton types -> the fit-gap specialist replaces the block agent (same agent count)
+python3 - <<'PY'
+import sys; sys.path.insert(0, "tools"); import containers, problem
+problem.write("out/test/many.txt", [dict(id=f"t{k}", l=300 + 7 * k, w=250 + 3 * k, h=200 + 5 * k, kg=5, qty=2, rot=1) for k in range(42)], containers.load())
+PY
+PC_TIME_MS=200 PC_ORDERS="out/test/many.txt" PC_OUT=out/test/disp script -qc "scripts/aura.sh aura/main.aura" /dev/null > out/test/disp.log 2>&1 || true
+if grep -q "派发：箱规" out/test/disp/explain.md && [ "$(grep -o 'committed\|rolled-back' out/test/disp/explain.md | wc -l)" = 4 ] && grep -q "拼缝" out/test/disp/explain.md; then echo "ok   aura-dispatch"; else echo "FAIL aura-dispatch"; fail=1; fi
+python3 - <<'PY' && echo "ok   dispatch-rules-in-sync" || { echo "FAIL dispatch-rules-in-sync"; fail=1; }
+import re, sys; sys.path.insert(0, "tools"); import agent_matrix as am
+src = open("aura/strategies.aura", encoding="utf-8").read()
+got = [(f, op, float(th), o, n) for f, op, th, o, n in re.findall(r"\(dispatch (\w+)\s+(>=|>|<=|<)\s+([\d.]+)\s+(\w+) (\w+)", src)]
+assert got == [(f, op, float(th), o, n) for f, op, th, o, n in am.DISPATCH], got
+for g in am.AGENTS: assert g in ("wall", "layer", "block", "human") or f"(specialist {g} " in src, g
+PY
+# 11) Aura consolidation agents: each agent in its own overlay, the cheapest plan that passes the site rules commits
+printf '{"K": ["out/test/cons.txt"]}' > out/test/cons-groups.json
+PC_CONS_GROUPS=out/test/cons-groups.json PC_OUT=out/test/cons-aura PC_CONS_TIME_S=3 PC_CONS_EXTRA="--base-type SLOT4 --max-fill 1 --search-ms 200" \
+  script -qc "scripts/aura.sh aura/consolidate-main.aura" /dev/null > out/test/cons-aura.log 2>&1 || true
+if grep -q "@@done=ok" out/test/cons-aura.log && grep -q "committed" out/test/cons-aura/explain.md && grep -q "rolled-back" out/test/cons-aura/explain.md \
+   && awk -F'\t' '$3==2' out/test/cons-aura/cons-summary.tsv | grep -q K; then echo "ok   aura-consolidate"; else echo "FAIL aura-consolidate"; fail=1; fi
 exit $fail
