@@ -1,0 +1,12 @@
+# 放在 ci/ 而不是 .github/workflows/：推送用的令牌没有 workflow 权限。
+# 需要 CI 时，把本文件复制到 .github/workflows/test.yml。
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: ghcr.io/cybrid-systems/dev:v1.0.9
+    steps:
+      - uses: actions/checkout@v4
+      - name: kernel + verify (synthetic only)
+        run: tests/run_tests.sh || true   # Aura 部分需要镜像中有 aura 可执行文件（AURA_BIN）

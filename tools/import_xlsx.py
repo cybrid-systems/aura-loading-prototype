@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Import customer cargo lists (xlsx / csv, Chinese or English headers) into kernel problem files.
+
+Customer data never goes into this repo: put it in a local directory and point PEICANG_DATA at it.
+
+  # 1) look at the structure only (sheet names, headers, row counts; no cell values are printed)
+  PEICANG_DATA=/path/to/data python3 tools/import_xlsx.py inspect
+  # 2) convert: one problem file per order (or per sheet when there is no order column)
+  PEICANG_DATA=/path/to/data python3 tools/import_xlsx.py convert --out out/real
+     [--map mapping.json]   # optional {"field": "header text"} overrides, see FIELDS below
+If the sheet also carries an existing loading plan (container no./type per line), convert records the
+number/types of containers actually used per order in <out>/import_report.json; tools/bench.py then adds
+an "EXIST 现有方案" column. Assumptions: weight = per box (per line ÷ qty if you know it is a line total),
+unload order = order of first appearance of the destination column, missing upright column = upright only.
+Pure standard library (zipfile + xml), no openpyxl needed.
+"""
+import argparse, csv, glob, json, os, re, statistics, sys, zipfile
+import xml.etree.ElementTree as ET
+sys.path.insert(0, os.path.dirname(__file__))
+import containers, problem
+
+NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+RNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+
+# field -> header synonyms (lower-cased substring match, first hit wins)
+FIELDS = {
+    "order": ["订单号", "订单", "单号", "委托号", "提单号", "booking", "order", "po"],
+    "sku": ["sku", "货号", "物料编码", "物料号", "品号", "型号", "item", "part"],
+    "name": ["品名", "货物名称", "名称", "description", "desc"],
+    "l": ["长", "length", "len", "l(mm)", "l(cm)"],
+    "w": ["宽", "width", "w(mm)", "w(cm)"],
+    "h": ["高", "height", "h(mm)", "h(cm)"],
+    "kg": ["毛重", "单件重", "单箱重", "重量", "weight", "gw", "kg"],
+    "qty": ["箱数", "件数", "数量", "qty", "quantity", "ctns", "pcs"],
+    "cbm": ["体积", "立方", "cbm", "volume", "m3"],
+    "stop": ["卸货顺序", "目的港", "卸货港", "站点", "pod", "stop", "destination"],
+    "upright": ["不可倒置", "朝上", "向上", "this side up", "upright", "可倒置", "倒置"],
+    "stack": ["堆叠", "可叠", "限压", "承重", "stack"],
+    "fragile": ["易碎", "fragile"],
+    "hazmat": ["危险品", "危险", "dg", "hazmat", "un"],
+    "container_no": ["柜号", "箱号", "container no", "cntr no", "container_no"],
+    "container_type": ["柜型", "箱型", "container type", "cntr type", "size"],
+}
+
+
+def col_idx(ref):
+    n = 0
+    for ch in re.match(r"[A-Z]+", ref).group(0):
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+def read_xlsx(path):
+    z = zipfile.ZipFile(path)
+    shared = []
+    if "xl/sharedStrings.xml" in z.namelist():
+        for si in ET.fromstring(z.read("xl/sharedStrings.xml")).findall("m:si", NS):
+            shared.append("".join(t.text or "" for t in si.iter("{%s}t" % NS["m"])))
+    wb = ET.fromstring(z.read("xl/workbook.xml"))
+    rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+    rmap = {r.get("Id"): r.get("Target") for r in rels}
+    sheets = {}
+    for s in wb.find("m:sheets", NS):
+        tgt = rmap[s.get(RNS)].lstrip("/")
+        tgt = tgt if tgt.startswith("xl/") else "xl/" + tgt
+        rows = []
+        for row in ET.fromstring(z.read(tgt)).iter("{%s}row" % NS["m"]):
+            vals = {}
+            for c in row.findall("m:c", NS):
+                v = c.find("m:v", NS); t = c.get("t")
+                if t == "s" and v is not None:
+                    val = shared[int(v.text)]
+                elif t == "inlineStr":
+                    val = "".join(x.text or "" for x in c.iter("{%s}t" % NS["m"]))
+                else:
+                    val = v.text if v is not None else ""
+                vals[col_idx(c.get("r"))] = val
+            if vals:
+                rows.append([vals.get(i, "") for i in range(max(vals) + 1)])
+        sheets[s.get("name")] = rows
+    return sheets
+
+
+def read_any(path):
+    if path.lower().endswith((".xlsx", ".xlsm")):
+        return read_xlsx(path)
+    if path.lower().endswith(".csv"):
+        for enc in ("utf-8-sig", "gb18030"):
+            try:
+                return {os.path.basename(path): list(csv.reader(open(path, encoding=enc)))}
+            except UnicodeDecodeError:
+                pass
+    return {}
+
+
+def data_files(root):
+    out = []
+    for p in sorted(glob.glob(os.path.join(root, "**", "*"), recursive=True)):
+        if p.lower().endswith(".zip"):
+            d = p + ".d"
+            if not os.path.isdir(d):
+                zipfile.ZipFile(p).extractall(d)
+        if p.lower().endswith((".xlsx", ".xlsm", ".csv")) and not os.path.basename(p).startswith("~$"):
+            out.append(p)
+    return out
+
+
+def find_header(rows):
+    """header row = the first row (within 15) that matches the most field synonyms"""
+    best, bi = -1, 0
+    for i, r in enumerate(rows[:15]):
+        hits = sum(1 for f in FIELDS if match_col([str(x) for x in r], f) is not None)
+        if hits > best:
+            best, bi = hits, i
+    return bi
+
+
+def match_col(header, field, override=None):
+    if override and field in override:
+        return header.index(override[field]) if override[field] in header else None
+    hl = [h.strip().lower() for h in header]
+    for syn in FIELDS[field]:
+        for i, h in enumerate(hl):
+            if syn in h and not (field == "l" and ("宽" in h or "高" in h)):
+                return i
+    return None
+
+
+def num(x):
+    try:
+        return float(str(x).replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def unit_scale(header_text, values):
+    h = header_text.lower()
+    if "mm" in h or "毫米" in h: return 1
+    if "cm" in h or "厘米" in h: return 10
+    if re.search(r"\(m\)|（m）|米", h): return 1000
+    med = statistics.median(values) if values else 0
+    return 1000 if med < 5 else 10 if med < 300 else 1
+
+
+def truthy(x):
+    s = str(x).strip().lower()
+    return s in ("1", "y", "yes", "true", "是", "√", "✓", "x") or "不可" in s
+
+
+def inspect(root):
+    for p in data_files(root):
+        for name, rows in read_any(p).items():
+            hi = find_header(rows) if rows else 0
+            hdr = [str(x) for x in rows[hi]] if rows else []
+            mapped = {f: hdr[c] for f in FIELDS if (c := match_col(hdr, f)) is not None}
+            print(json.dumps({"file": os.path.relpath(p, root), "sheet": name, "rows": len(rows) - hi - 1,
+                              "header_row": hi + 1, "headers": hdr, "mapped": mapped}, ensure_ascii=False))
+
+
+def convert(root, out, override=None):
+    os.makedirs(out, exist_ok=True)
+    cts = containers.load(); report = []; existing = {}
+    for p in data_files(root):
+        for sname, rows in read_any(p).items():
+            if not rows:
+                continue
+            hi = find_header(rows); hdr = [str(x) for x in rows[hi]]
+            col = {f: match_col(hdr, f, override) for f in FIELDS}
+            if any(col[f] is None for f in ("l", "w", "h")):
+                report.append({"sheet": sname, "skipped": "no L/W/H columns", "mapped": {f: c for f, c in col.items() if c is not None}})
+                continue
+            body = [r for r in rows[hi + 1:] if any(str(x).strip() for x in r)]
+            get = lambda r, f: r[col[f]] if col[f] is not None and col[f] < len(r) else ""
+            sc = {d: unit_scale(hdr[col[d]], [v for r in body if (v := num(get(r, d)))]) for d in ("l", "w", "h")}
+            stops = {}
+            orders = {}
+            for k, r in enumerate(body):
+                l, w, h = (num(get(r, d)) for d in ("l", "w", "h"))
+                if not l or not w or not h:
+                    continue
+                qty = int(num(get(r, "qty")) or 1)
+                kg = num(get(r, "kg")) or 0.0
+                st = str(get(r, "stop")).strip()
+                stop = stops.setdefault(st, len(stops) + 1)
+                o = str(get(r, "order")).strip() or sname
+                it = dict(id=f"L{k+1}", sku=f"L{k+1}", l=round(l * sc["l"]), w=round(w * sc["w"]), h=round(h * sc["h"]), kg=kg, qty=qty,
+                          rot=1 if (col["upright"] is None or truthy(get(r, "upright"))) else 0,
+                          fragile=col["fragile"] is not None and truthy(get(r, "fragile")),
+                          stop=stop, hazmat=str(get(r, "hazmat")).strip() if col["hazmat"] is not None and truthy(get(r, "hazmat")) else "")
+                orders.setdefault(o, []).append(it)
+                cn, ctp = str(get(r, "container_no")).strip(), str(get(r, "container_type")).strip()
+                if cn:
+                    existing.setdefault(o, {})[cn] = ctp
+            for i, (o, items) in enumerate(orders.items()):
+                # anonymised file names: real order ids stay out of every output that might be shared
+                fn = os.path.join(out, f"real_{len(report):02d}_{i:03d}.txt")
+                problem.write(fn, items, cts)
+                report.append({"file": os.path.basename(fn), "source_sheet": sname, "lines": len(items),
+                               "boxes": sum(x["qty"] for x in items), "unit_scale": sc,
+                               "existing_containers": existing.get(o, {}) and len(existing[o]),
+                               "existing_types": sorted(set(existing.get(o, {}).values()))})
+    json.dump(report, open(os.path.join(out, "import_report.json"), "w"), ensure_ascii=False, indent=1)
+    print(f"converted {sum(1 for r in report if 'file' in r)} problems into {out} (see import_report.json)")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["inspect", "convert"])
+    ap.add_argument("--out", default="out/real")
+    ap.add_argument("--map")
+    a = ap.parse_args()
+    root = os.environ.get("PEICANG_DATA")
+    if not root or not os.path.isdir(root):
+        sys.exit("set PEICANG_DATA to the local directory holding the customer files")
+    if a.cmd == "inspect":
+        inspect(root)
+    else:
+        convert(root, a.out, json.load(open(a.map, encoding="utf-8")) if a.map else None)
+
+
+if __name__ == "__main__":
+    main()

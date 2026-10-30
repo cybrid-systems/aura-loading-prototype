@@ -1,0 +1,81 @@
+;; aura/rules.aura — 配仓规则 EDSL（规则即数据，运行时可替换，不改内核代码）
+;;
+;; 一条规则： (类别 名称 参数... "说明")
+;;   hard   —— 下推给 C++ 内核作为硬约束（支撑率、先卸后装、危险品间距、柜型限定…）
+;;   check  —— 方案出来后由 Aura 校验（重心范围、端部载荷、未装箱数、最低利用率…），不满足即否决
+;;   prefer —— 软目标，进入协调器加权评分
+;; 规则集是普通 list，可以在运行时 rebind / 从文件 load，再由 compile-rules 编译成内核参数 + 校验谓词。
+
+(define default-rules
+  '((hard  min-support   0.75  "货物底面至少 75% 有支撑")
+    (hard  lifo          1     "先卸后装：先到站的货不能被后到站的货挡住")
+    (hard  hazmat-sep    1000  "不同类别危险品纵向间距 ≥ 1000mm")
+    (check cog-x         0.30 0.70 "重心纵向位置（占柜长比例）")
+    (check cog-y         0.40 0.60 "重心横向位置（占柜宽比例）")
+    (check max-unplaced  0     "所有货物必须装下")
+    (check end-load      18000 "单端（前端/门端）分担载荷 ≤ 18000kg（两点支撑近似）")
+    (prefer cost         1.0   "运费（相对柜价）")
+    (prefer vol-util     0.3   "体积利用率")
+    (prefer cog-dev      0.2   "重心偏离中心")))
+
+(define (rule-kind r) (car r))
+(define (rule-name r) (cadr r))
+(define (rule-args r) (cddr r))
+(define (rule-doc r) (let ((a (rule-args r))) (list-ref a (- (length a) 1))))
+(define (rule-arg r i) (list-ref (rule-args r) i))
+(define (rules-of kind rs) (filter (lambda (r) (eq? (rule-kind r) kind)) rs))
+(define (find-rule rs kind name)
+  (let loop ((xs rs)) (cond ((null? xs) #f)
+                            ((and (eq? (rule-kind (car xs)) kind) (eq? (rule-name (car xs)) name)) (car xs))
+                            (else (loop (cdr xs))))))
+(define (rule-num rs kind name i dflt) (let ((r (find-rule rs kind name))) (if r (rule-arg r i) dflt)))
+
+;; hard 规则 -> 内核命令行参数
+(define (rules->kernel-args rs)
+  (let ((a (list)))
+    (for-each (lambda (r)
+                (let ((n (rule-name r)))
+                  (cond ((eq? n 'min-support) (set! a (cons (format "min_support=~a" (rule-arg r 0)) a)))
+                        ((eq? n 'lifo) (set! a (cons (format "lifo=~a" (rule-arg r 0)) a)))
+                        ((eq? n 'hazmat-sep) (set! a (cons (format "hazmat_sep=~a" (rule-arg r 0)) a)))
+                        ((eq? n 'only-type) (set! a (cons (format "only=~a" (rule-arg r 0)) a))))))
+              (rules-of 'hard rs))
+    (let ((cx (find-rule rs 'check 'cog-x)) (cy (find-rule rs 'check 'cog-y)))
+      (if cx (set! a (cons (format "cog_x_lo=~a cog_x_hi=~a" (rule-arg cx 0) (rule-arg cx 1)) a)) #f)
+      (if cy (set! a (cons (format "cog_y_lo=~a cog_y_hi=~a" (rule-arg cy 0) (rule-arg cy 1)) a)) #f))
+    (join-strings (reverse a) " ")))
+
+(define (join-strings xs sep)
+  (if (null? xs) "" (foldl (lambda (acc x) (string-append acc sep x)) (car xs) (cdr xs))))
+
+(define (hget h k d) (if (and (hash? h) (hash-has-key? h k)) (hash-ref h k) d))
+
+;; check 规则 -> 对一个方案（json-parse 后的 hash）给出违例列表，空表 = 通过
+(define (check-plan rs plan)
+  (let ((m (hget plan "metrics" #f)) (cs (hget plan "containers" (list))) (bad (list)))
+    (for-each
+      (lambda (r)
+        (let ((n (rule-name r)))
+          (cond
+            ((eq? n 'max-unplaced)
+             (if (> (hget m "unplaced" 0) (rule-arg r 0)) (set! bad (cons (format "未装货物 ~a 件" (hget m "unplaced" 0)) bad)) #f))
+            ((or (eq? n 'cog-x) (eq? n 'cog-y))
+             (for-each (lambda (c)
+                         (let ((v (list-ref (hget c "cog" (list 0.5 0.5 0)) (if (eq? n 'cog-x) 0 1))))
+                           (if (or (< v (rule-arg r 0)) (> v (rule-arg r 1)))
+                               (set! bad (cons (format "~a ~a=~a 超出 [~a,~a]" (hget c "type" "?") n (r3 v) (rule-arg r 0) (rule-arg r 1)) bad)) #f)))
+                       cs))
+            ((eq? n 'end-load)
+             (for-each (lambda (c)
+                         (let* ((e (hget c "end_load_kg" #f)) (f (hget e "front" 0)) (d (hget e "door" 0)))
+                           (if (> (max f d) (rule-arg r 0))
+                               (set! bad (cons (format "~a 端部载荷 ~akg > ~a" (hget c "type" "?") (round (max f d)) (rule-arg r 0)) bad)) #f)))
+                       cs))
+            ((eq? n 'min-vol-util)
+             (if (< (hget m "vol_util" 0) (rule-arg r 0)) (set! bad (cons (format "体积利用率 ~a < ~a" (r3 (hget m "vol_util" 0)) (rule-arg r 0)) bad)) #f))
+            (else #f))))
+      (rules-of 'check rs))
+    (reverse bad)))
+
+(define (r3 x) (/ (round (* x 1000.0)) 1000.0))
+(define (absf x) (if (< x 0) (- 0 x) x))

@@ -1,0 +1,10 @@
+# C name L W H max_kg cost limit(-1=unlimited)
+C 20GP 5898 2352 2393 28200 1.0 -1
+C 40HQ 12032 2352 2698 26500 1.6 -1
+C 45HC 13556 2352 2698 27700 1.85 -1
+# I id sku l w h kg qty rot(0=any,1=upright,2=fixed) max_top_kg fragile stop hazmat
+I S11-001 long-001 2190 280 260 54.1 47 1 0 1 2 -
+I S11-002 pallet-002 1240 1040 1050 477.1 4 1 3816.8 0 2 -
+I S11-003 long-003 2260 220 190 21.0 27 0 168.0 0 3 -
+I S11-004 carton-l-004 860 610 720 36.1 22 1 108.3 0 1 -
+I S11-005 long-005 2110 220 240 29.4 44 1 235.2 0 2 3

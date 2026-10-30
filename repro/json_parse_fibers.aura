@@ -1,0 +1,6 @@
+(define (range n) (let loop ((i (- n 1)) (acc (list))) (if (< i 0) acc (loop (- i 1) (cons i acc)))))
+(define (rt) (let* ((res (channel:create 16))
+   (fs (map (lambda (k) (fiber:spawn (lambda () (let ((res res)) (channel:send res (json-parse (read-file "repro/big.json"))))))) (range 4)))
+   (ps (map (lambda (f) (channel:recv res)) fs))) (for-each fiber:join fs) (length ps)))
+(for-each (lambda (r) (display (format "round ~a ~a" r (rt))) (newline)) (range 30))
+(display "@@done=ok") (newline)

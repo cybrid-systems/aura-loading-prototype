@@ -1,0 +1,16 @@
+;; 入口：PC_ORDERS（历史订单）PC_FEEDBACK（现场反馈文件）PC_OUT
+(define out-dir (let ((o (getenv "PC_OUT"))) (if (and (string? o) (> (string-length o) 0)) o "out/evolve")))
+(sh (string-append "mkdir -p " out-dir))
+(define (split-ws s)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (start 0) (acc (list)))
+      (cond ((= i n) (reverse (if (> i start) (cons (substring s start i) acc) acc)))
+            ((char=? (string-ref s i) #\space) (loop (+ i 1) (+ i 1) (if (> i start) (cons (substring s start i) acc) acc)))
+            (else (loop (+ i 1) start acc))))))
+(define fb (read-feedback (getenv "PC_FEEDBACK")))
+(define result (evolve (split-ws (getenv "PC_ORDERS")) fb (string-append out-dir "/evolve-audit.tsv")))
+(write-file (string-append out-dir "/evolved.txt")
+  (format "final_cost=~a violations=~a\nparams=~a\nmin_support=~a end_load=~a lifo=~a\n"
+          (r3 (car (car result))) (cadr (car result)) active-params
+          (rule-num active-rules 'hard 'min-support 0 "?") (rule-num active-rules 'check 'end-load 0 "?") (rule-num active-rules 'hard 'lifo 0 "?")))
+(display "@@done=ok") (newline)

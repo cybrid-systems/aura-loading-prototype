@@ -1,0 +1,14 @@
+# 客户数据绝不入库：原始文件放在仓库外，用 PEICANG_DATA 指过去
+*.xlsx
+*.xlsm
+*.xls
+*.zip
+*.csv
+data/
+peicang-data/
+out/
+build/
+real_*.txt
+import_report.json
+__pycache__/
+repro/*.json

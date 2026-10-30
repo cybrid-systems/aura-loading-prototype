@@ -1,0 +1,104 @@
+;; aura/agents.aura — 多 Agent 并行提案 + 协调器选优
+;;
+;; 每个 Agent = 一组内核参数（排序策略、位置评分权重、柜型策略）。协调器为每个 Agent 开一个 fiber，
+;; fiber 在自己的 COW overlay 里写入候选方案（fiber:overlay-define "plan" ...），互不可见；
+;; 协调器收齐后按规则否决 + 加权评分选优，只让胜出者 overlay-commit，其余 overlay-rollback。
+;; C++ 内核以子进程后台运行，fiber 只轮询结果文件，所以多个 Agent 的求解在多核上真并行。
+
+(require "std/process" all:)
+
+(define agents
+  (list
+    (list "空间优化" "sort=0 w_x=1.0 w_z=0.15 w_y=0.02 iters=400")
+    (list "稳定/重量" "sort=2 w_x=1.0 w_z=0.40 w_center=0.4 iters=400")
+    (list "卸货顺序" "sort=1 sort_stop=1 w_x=1.0 w_z=0.10 iters=400")
+    (list "成本" "sort=3 w_x=1.0 w_z=0.20 iters=400")))
+
+(define *kernel* (let ((k (getenv "PC_KERNEL"))) (if (and (string? k) (> (string-length k) 0)) k "build/pack")))
+(define *time-ms* (let ((t (getenv "PC_TIME_MS"))) (if (and (string? t) (> (string-length t) 0)) t "8000")))
+
+;; 后台启动内核，返回结果文件路径
+(define (kernel-launch problem out-prefix params rule-args seed)
+  (let ((out (string-append out-prefix ".json")) (done (string-append out-prefix ".done")))
+    (sh (string-append "rm -f " out " " done))
+    (sh (string-append "( " *kernel* " --in " problem " --out " out " " rule-args " " params
+                       " seed=" (number->string seed) " time_ms=" *time-ms* " > " out-prefix ".log 2>&1; echo $? > " done " ) &"))
+    out))
+
+(define (await-file done)
+  (let loop ((n 0))
+    (let ((v (read-file done)))
+      (if (and (string? v) (> (string-length v) 0)) v
+          (begin (sh "sleep 0.05") (fiber:yield) (loop (+ n 1)))))))
+
+;; spawn a fiber that always reports on ch (a raised error otherwise just kills the fiber).
+;; 参数在 fiber 内重新 let 绑定：69d360068 上 fiber 里的 catch 看不到外层过程参数（aura#4781）。
+(define (spawn-reporting ch tag th)
+  (fiber:spawn (lambda ()
+    (let ((ch ch) (tag tag) (th th))
+      (let ((v (try (th) (catch (e) (list 'error tag (format "~a" e))))))
+        (channel:send ch v))
+      tag))))
+
+(define (plan-cost p) (hget (hget p "metrics" #f) "cost" 1e9))
+(define (plan-cogdev p)
+  (foldl (lambda (acc c) (let ((g (hget c "cog" (list 0.5 0.5 0))))
+                           (max acc (absf (- (car g) 0.5)) (absf (- (cadr g) 0.5)))))
+         0 (hget p "containers" (list))))
+
+;; 加权评分（越小越好）；成本按本轮最低成本归一
+(define (score-plan rs p min-cost)
+  (+ (* (rule-num rs 'prefer 'cost 0 1.0) (/ (plan-cost p) min-cost))
+     (* (rule-num rs 'prefer 'vol-util 0 0.3) (- 1 (hget (hget p "metrics" #f) "vol_util" 0)))
+     (* (rule-num rs 'prefer 'cog-dev 0 0.2) (plan-cogdev p))))
+
+;; 一个订单的完整决策。返回 hash：winner / plan / score / proposals / rejected / statuses / audit
+(define (decide problem out-prefix rs)
+  (let* ((res (channel:create 16)) (fin (channel:create 16)) (rargs (rules->kernel-args rs))
+         (n (length agents))
+         (verdicts (map (lambda (a) (channel:create 1)) agents))
+         (fs (map (lambda (k)
+                    (let* ((a (list-ref agents k)) (name (car a)) (params (cadr a)) (vch (list-ref verdicts k)))
+                      (spawn-reporting fin name
+                        (lambda ()
+                          (let ((name name) (params params) (k k) (vch vch) (res res) (problem problem) (out-prefix out-prefix) (rargs rargs))
+                            (fiber:overlay-begin)
+                            (let* ((pre (format "~a.agent~a" out-prefix k))
+                                   (out (kernel-launch problem pre params rargs (+ 11 k))))
+                              (await-file (string-append pre ".done"))
+                              ;; json-parse 只在协调器（主 fiber）里做：多个 fiber 并发 json-parse 会 double free（aura#ISSUE_JSON）
+                              (begin
+                                (fiber:overlay-define "chosen-plan" out)   ;; 私有写入：其他 fiber / 主线程不可见
+                                (channel:send res (list name out))
+                                (let ((v (channel:recv vch)))              ;; 等协调器裁决
+                                  (if (equal? v "commit")
+                                      (begin (fiber:overlay-commit) (format "~a:committed" name))
+                                      (begin (fiber:overlay-rollback) (format "~a:rolled-back" name)))))))))))
+                  (range n)))
+         (props (map (lambda (m) (list (car m) (try (json-parse (read-file (cadr m))) (catch (e) #f)) (cadr m)))
+                     (map (lambda (f) (channel:recv res)) fs)))
+         (seen-before (safe (lambda () chosen-plan) "unbound"))
+         (valid (filter (lambda (p) (and (cadr p) (null? (check-plan rs (cadr p))))) props))
+         (rejected (filter (lambda (p) (not (and (cadr p) (null? (check-plan rs (cadr p)))))) props))
+         (min-cost (if (null? valid) 1 (foldl (lambda (m p) (min m (plan-cost (cadr p)))) 1e18 valid)))
+         (scored (list-sort (lambda (a b) (< (cadr a) (cadr b)))
+                            (map (lambda (p) (list p (score-plan rs (cadr p) min-cost))) valid)))
+         (winner (if (null? scored) #f (car (car scored)))))
+    (for-each (lambda (k) (channel:send (list-ref verdicts k)
+                                        (if (and winner (equal? (car winner) (car (list-ref agents k)))) "commit" "rollback")))
+              (range n))
+    (let* ((statuses (map (lambda (f) (channel:recv fin)) fs))
+           (h (hash)))
+      (for-each fiber:join fs)
+      (hash-set! h "winner" (if winner (car winner) #f))
+      (hash-set! h "plan" (if winner (cadr winner) #f))
+      (hash-set! h "plan-file" (if winner (caddr winner) #f))
+      (hash-set! h "scored" scored)
+      (hash-set! h "rejected" (map (lambda (p) (list (car p) (if (cadr p) (check-plan rs (cadr p)) (list "内核无输出")))) rejected))
+      (hash-set! h "statuses" statuses)
+      (hash-set! h "global-before" seen-before)
+      (hash-set! h "global-after" (safe (lambda () chosen-plan) "unbound"))
+      h)))
+
+(define (range n) (let loop ((i (- n 1)) (acc (list))) (if (< i 0) acc (loop (- i 1) (cons i acc)))))
+(define (safe th d) (try (th) (catch (e) d)))

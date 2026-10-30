@@ -1,0 +1,106 @@
+;; aura/evolve.aura — 反馈驱动的策略演化（worldline 试验 + KEEP/ROLLBACK 门禁 + 审计日志）
+;;
+;; 现场回传（PC_FEEDBACK 文件，每行 "key value"）例如：
+;;   damage_rate 0.031      实际破损率
+;;   door_overload 2        门端超载事件数
+;; 演化循环：每一步生成一个候选变更（改规则或改 Agent 参数），在独立 fiber 的 COW overlay 里暂存
+;; （overlay-define "active-rules"/"active-params"），用历史订单批量回放评估；
+;; 门禁通过（无违例、总运费不升、满足反馈要求）才 overlay-commit，否则 overlay-rollback。每步写审计行。
+
+(define active-rules default-rules)
+(define active-params "sort=0 w_x=1.0 w_z=0.15 w_y=0.02 iters=150")
+
+(define (read-feedback path)
+  (let ((h (hash)) (txt (read-file path)))
+    (if (string? txt)
+        (for-each (lambda (line) (let ((p (split-ws line)))
+                                   (if (= (length p) 2) (hash-set! h (car p) (string->number (cadr p))) #f)))
+                  (split-lines txt))
+        #f)
+    h))
+(define (split-lines s)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (start 0) (acc (list)))
+      (cond ((= i n) (reverse (if (> i start) (cons (substring s start i) acc) acc)))
+            ((char=? (string-ref s i) #\newline) (loop (+ i 1) (+ i 1) (cons (substring s start i) acc)))
+            (else (loop (+ i 1) start acc))))))
+
+;; 用一组 (rules, params) 回放历史订单：每单一个后台内核进程，fiber 并发等待
+(define (replay rs params orders tag)
+  (let* ((ch (channel:create 64)) (rargs (rules->kernel-args rs))
+         (fs (map (lambda (k)
+                    (let ((o (list-ref orders k)))
+                      (spawn-reporting ch o
+                        (lambda ()
+                          (let ((o o) (k k) (rs rs) (params params) (rargs rargs) (tag tag))
+                            (let* ((pre (format "~a/evo-~a-~a" out-dir tag k))
+                                   (out (kernel-launch o pre params rargs 7)))
+                              (await-file (string-append pre ".done"))
+                              out))))))
+                  (range (length orders))))
+         ;; 结果在主 fiber 里解析（见 agents.aura：fiber 内并发 json-parse 会崩溃）
+         (rs-list (map (lambda (f) (let ((out (channel:recv ch)))
+                                     (try (let ((p (json-parse (read-file out)))) (list (plan-cost p) (length (check-plan rs p))))
+                                          (catch (e) #f))))
+                       fs)))
+    (for-each fiber:join fs)
+    (list (foldl (lambda (a r) (+ a (if (pair? r) (car r) 1e6))) 0 rs-list)
+          (foldl (lambda (a r) (+ a (if (pair? r) (cadr r) 1))) 0 rs-list))))
+
+(define (with-rule rs kind name new-args)
+  (map (lambda (r) (if (and (eq? (rule-kind r) kind) (eq? (rule-name r) name)) (cons kind (cons name new-args)) r)) rs))
+
+;; 候选变更生成：反馈先行（安全相关），之后是参数探索。
+;; 每个候选的值是 thunk，在轮到它时基于“当前已提交的” active-rules 生成，避免后一步覆盖前一步的 KEEP。
+(define (candidates fb)
+  (append
+    (if (> (hget fb "damage_rate" 0) 0.02)
+        (list (list "反馈:破损率高→支撑率 0.75→0.85" 'rules (lambda () (with-rule active-rules 'hard 'min-support (list 0.85 "货物底面至少 85% 有支撑（由破损反馈演化）")))))
+        (list))
+    (if (> (hget fb "door_overload" 0) 0)
+        (list (list "反馈:门端超载→端部载荷 18000→15000" 'rules (lambda () (with-rule active-rules 'check 'end-load (list 15000 "单端载荷 ≤ 15000kg（由超载反馈演化）")))))
+        (list))
+    (list (list "参数:按底面积排序" 'params (lambda () "sort=1 w_x=1.0 w_z=0.15 w_y=0.02 iters=150"))
+          (list "参数:按高度排序 + 更重视低层" 'params (lambda () "sort=3 w_x=1.0 w_z=0.40 w_y=0.02 iters=150"))
+          (list "参数:不分站排序(应被门禁拒绝或无收益)" 'params (lambda () "sort=0 sort_stop=0 w_x=1.0 w_z=0.15 iters=150"))
+          (list "规则:关闭先卸后装(有害但合法，应被门禁拒绝)" 'rules (lambda () (with-rule active-rules 'hard 'lifo (list 0 "关闭先卸后装")))))))
+
+;; 门禁：安全规则不允许被放松；违例数不升；总运费不升
+(define (safety-floor-ok? rs)
+  (and (>= (rule-num rs 'hard 'lifo 0 0) 1) (>= (rule-num rs 'hard 'min-support 0 0) 0.75)))
+
+(define (evolve orders fb audit-path)
+  (let* ((base (replay active-rules active-params orders "base")) (audit-lines (list)) (step 0))
+    (define (audit! s) (set! audit-lines (cons s audit-lines)))
+    (audit! (format "step\tchange\tcost_before\tcost_after\tviol_before\tviol_after\tdecision\treason"))
+    (for-each
+      (lambda (c)
+        (set! step (+ step 1))
+        (let* ((label (car c)) (kind (cadr c)) (val ((caddr c)))
+               (rs (if (eq? kind 'rules) val active-rules)) (ps (if (eq? kind 'params) val active-params))
+               (res (channel:create 2))
+               (f (spawn-reporting res label
+                    (lambda ()
+                      (let ((rs rs) (ps ps) (kind kind) (step step) (orders orders) (base base) (label label) (fb fb))
+                        (fiber:overlay-begin)                       ;; 独立 worldline
+                        (if (eq? kind 'rules) (fiber:overlay-define "active-rules" rs) (fiber:overlay-define "active-params" ps))
+                        (let* ((r (replay rs ps orders (format "s~a" step)))
+                               (feedback-change (string-contains? label "反馈"))
+                               (reason
+                                 (cond ((not (safety-floor-ok? rs)) "放松了安全底线规则")
+                                       ((> (cadr r) (cadr base)) "违例数上升")
+                                       ((and (not feedback-change) (>= (car r) (car base))) "总运费无下降")
+                                       ((and feedback-change (> (car r) (* 1.05 (car base)))) "安全收紧导致运费上升超过 5%")
+                                       (else #f))))
+                          (if reason (fiber:overlay-rollback) (fiber:overlay-commit))
+                          (list r (if reason "ROLLBACK" "KEEP") (if reason reason (if feedback-change "满足现场反馈，运费增幅 ≤5%" "运费下降"))))))))
+               (out (channel:recv res)))
+          (fiber:join f)
+          (if (pair? out)
+              (let ((r (car out)) (dec (cadr out)))
+                (audit! (format "~a\t~a\t~a\t~a\t~a\t~a\t~a\t~a" step label (r3 (car base)) (r3 (car r)) (cadr base) (cadr r) dec (caddr out)))
+                (if (equal? dec "KEEP") (set! base r) #f))
+              (audit! (format "~a\t~a\t-\t-\t-\t-\tERROR\t~a" step label out)))))
+      (candidates fb))
+    (write-file audit-path (join-strings (reverse audit-lines) "\n"))
+    (list base active-rules active-params)))

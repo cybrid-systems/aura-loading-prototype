@@ -1,0 +1,2 @@
+damage_rate 0.031
+door_overload 1

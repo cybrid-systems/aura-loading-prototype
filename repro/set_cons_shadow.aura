@@ -1,0 +1,6 @@
+;; 局部变量与原语同名时 (set! x (cons v x)) 的右值被解析成全局原语
+(define (h1) (let ((foo (list))) (set! foo (cons 1 foo)) foo))
+(define (h2) (let ((log (list))) (set! log (cons 1 log)) log))
+(define (h3) (let ((sqrt (list))) (set! sqrt (cons 1 sqrt)) sqrt))
+(define (h4) (let ((log 1)) (set! log (+ 1 log)) log))
+(display (format "h1=~a h2=~a h3=~a h4=~a" (h1) (h2) (h3) (h4))) (newline)

@@ -1,0 +1,45 @@
+;; aura/main.aura — 批量跑订单：规则编译 -> 多 Agent 提案 -> 协调器选优 -> 解释报告
+;; 环境变量：PC_ORDERS="a.txt b.txt"  PC_OUT=out/run  PC_RULES=<可选，规则文件，内容为一个规则 list>
+(define (split-ws s)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (start 0) (acc (list)))
+      (cond ((= i n) (reverse (if (> i start) (cons (substring s start i) acc) acc)))
+            ((char=? (string-ref s i) #\space) (loop (+ i 1) (+ i 1) (if (> i start) (cons (substring s start i) acc) acc)))
+            (else (loop (+ i 1) start acc))))))
+
+(define *rules*
+  (let ((f (getenv "PC_RULES")))
+    (if (and (string? f) (> (string-length f) 0)) (read (open-input-string (read-file f))) default-rules)))
+
+(define (explain order h)
+  (let ((lines (list)))
+    (define (out! s) (set! lines (cons s lines)))
+    (out! (format "## ~a" order))
+    (out! (format "- 采用：**~a** Agent 方案" (hget h "winner" "无")))
+    (for-each (lambda (s) (let ((p (car s)) (m (hget (cadr (car s)) "metrics" #f)))
+                            (out! (format "- ~a：评分 ~a，柜 ~a（~a），相对运费 ~a，体积利用率 ~a%"
+                                          (car p) (r3 (cadr s)) (hget m "containers" "?") (hget m "mix" "?")
+                                          (r3 (hget m "cost" 0)) (r3 (* 100 (hget m "vol_util" 0)))))))
+              (hget h "scored" (list)))
+    (for-each (lambda (r) (out! (format "- 否决 ~a：~a" (car r) (join-strings (cadr r) "；")))) (hget h "rejected" (list)))
+    (out! (format "- 生效的硬约束：~a" (join-strings (map (lambda (r) (rule-doc r)) (rules-of 'hard *rules*)) "；")))
+    (out! (format "- overlay：提案期间全局 chosen-plan=~a，裁决后=~a；~a" (hget h "global-before" "?") (hget h "global-after" "?")
+                  (join-strings (hget h "statuses" (list)) ", ")))
+    (reverse lines)))
+
+(define out-dir (let ((o (getenv "PC_OUT"))) (if (and (string? o) (> (string-length o) 0)) o "out/run")))
+(sh (string-append "mkdir -p " out-dir))
+(define report (list "# 决策解释报告（Aura 协调器生成）" ""))
+(define summary (list))
+(for-each
+  (lambda (path)
+    (let* ((base (let ((p (split-ws (list->string (map (lambda (c) (if (char=? c #\/) #\space c)) (string->list path)))))) (list-ref p (- (length p) 1))))
+           (t0 (monotonic-ms))
+           (h (decide path (string-append out-dir "/" base) *rules*))
+           (ms (- (monotonic-ms) t0)))
+      (set! report (append report (explain base h) (list "")))
+      (set! summary (cons (format "~a\t~a\t~a\t~a" base (hget h "winner" "-") (hget h "plan-file" "-") ms) summary))))
+  (split-ws (getenv "PC_ORDERS")))
+(write-file (string-append out-dir "/explain.md") (join-strings report "\n"))
+(write-file (string-append out-dir "/aura-summary.tsv") (join-strings (reverse summary) "\n"))
+(display "@@done=ok") (newline)
