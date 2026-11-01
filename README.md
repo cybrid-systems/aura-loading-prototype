@@ -12,6 +12,7 @@
 ## 结构
 
 ```
+build.py                 编译 C++ 内核，并把下面「运行」一节收成子命令（python3 build.py --help）
 kernel/pack.cpp          C++20 三维装箱内核入口：algo=ep 极点启发式 + 局部搜索（第一版）；algo=block 调块构造内核
 kernel/blocks.hpp        块构造内核：极大空闲空间 + 同规格块（每轴按最大数 / 一维背包取数）+ 前瞻搜索 + 随机重启
 tools/import_xlsx.py     真实数据导入：xlsx/csv/zip → 内核格式（只用标准库，自动识别中英文表头和 mm/cm/m）
@@ -60,57 +61,45 @@ docs/                    格式说明、合成数据基准、决策解释示例�
 
 ## 运行
 
-需要 g++ (C++20)、python3；Aura 部分需要 `aura` 可执行文件（开发时用的是 `ghcr.io/cybrid-systems/dev:v1.0.9` 镜像和 aura `69d360068`），并设置 `AURA_SANDBOX=off AURA_PIPELINE_STRICT=0`。
+需要 g++ (C++20) 和 python3。编译和下面这些步骤都走 `build.py`（源文件没变会跳过）：
 
 ```bash
-g++ -O2 -std=c++20 -o build/pack kernel/pack.cpp
-python3 tools/gen_synthetic.py --orders 12 --seed 7 --out examples/synthetic   # 已提交，可直接用
-build/pack --in examples/synthetic/order_10.txt --out out/r.json time_ms=3000
-python3 tools/verify.py out/r.json
-python3 tools/viz.py out/r.json out/r.html
+python3 build.py                  # g++ -O2 -std=c++20 -Wall -Werror -o build/pack kernel/pack.cpp
+python3 build.py demo             # order_10 → out/r.json，校验，out/r.html
+python3 build.py demo --block     # 块构造内核 → out/b.json，同样校验并生成 html
+python3 build.py aura main        # 多 Agent。默认 order_01 与 order_07，输出 out/aura
+python3 build.py aura evolve      # 规则演化。默认 order_01–04 + examples/feedback.synthetic.txt
+python3 build.py aura tune        # 权重演化。默认训练 order_01–06，留出 order_1*，3 代
+python3 build.py aura consolidate # 拼柜多 Agent。默认 examples/pool，每条线路 30 s
+python3 build.py bench            # 合成基准：--strategies --aura，每策略 2 s
+python3 build.py consolidate nf   # 按到货顺序拼柜，只用 45HC
+python3 build.py consolidate lns  # LNS，120 s/线路
+python3 build.py matrix           # Agent 贡献矩阵 → out/matrix.json
+python3 build.py matrix --report
+python3 build.py pk --problems examples/synthetic --plans 甲=dirA 乙=dirB --ours-ms 2000 --md out/pk.md
+python3 build.py test
 
-# 多 Agent（Aura）
-PC_ORDERS="examples/synthetic/order_01.txt examples/synthetic/order_07.txt" PC_OUT=out/aura \
-  script -qc "scripts/aura.sh aura/main.aura" /dev/null
-# 规则演化
-PC_ORDERS="$(ls examples/synthetic/order_0[1-4].txt | tr '\n' ' ')" PC_FEEDBACK=examples/feedback.synthetic.txt PC_OUT=out/evo \
-  script -qc "scripts/aura.sh aura/evolve-main.aura" /dev/null
-# 人工经验权重演化（训练集 / 留出集）
-PC_TRAIN="$(ls examples/synthetic/order_0[1-6].txt | tr '\n' ' ')" PC_HOLDOUT="$(ls examples/synthetic/order_1*.txt | tr '\n' ' ')" PC_GENS=3 \
-  PC_OUT=out/tune script -qc "scripts/aura.sh aura/tune-main.aura" /dev/null
-PC_STRATEGIES=out/tune/tuned-strategies.txt PC_ORDERS=... script -qc "scripts/aura.sh aura/main.aura" /dev/null   # 用调好的权重
-# 基准
-python3 tools/bench.py --orders examples/synthetic --out out/bench --time-ms 2000 --strategies --aura
-python3 tools/bench.py --orders out/real --out out/fill --time-ms 2000 --strategies --aura --fill   # 单个 45HC 最大装载率
-# 块构造内核单跑
-build/pack --in examples/synthetic/order_10.txt --out out/b.json algo=block space=0 w_vol=1 w_yz=0.5 time_ms=2000
-# 拼柜（多票 → 多柜）
-python3 tools/gen_pool.py --routes 6 --seed 11 --out examples/pool               # 已提交
-python3 tools/consolidate.py --groups examples/pool/pools.json --algo nf --types 45HC --out out/cons-nf
-python3 tools/consolidate.py --groups examples/pool/pools.json --algo lns --time-s 120 --out out/cons-lns
-PC_CONS_GROUPS=examples/pool/pools.json PC_OUT=out/cons-aura PC_CONS_TIME_S=30 \
-  script -qc "scripts/aura.sh aura/consolidate-main.aura" /dev/null
-# Agent 贡献矩阵 / 按特征派发
-python3 tools/agent_matrix.py --problems examples/synthetic/order_*.txt --out out/matrix.json --time-ms 2000
-python3 tools/agent_matrix.py --report out/matrix.json
-# PK 盲测
-python3 tools/pk.py --problems examples/synthetic --plans 甲=dirA 乙=dirB --ours-ms 2000 --md out/pk.md
-# 测试
-tests/run_tests.sh
+# 参数直接接在子命令后面；环境变量盖过默认值
+PC_STRATEGIES=out/tune/tuned-strategies.txt PC_ORDERS="examples/synthetic/order_10.txt" \
+  python3 build.py aura main
+python3 build.py bench --orders out/real --out out/fill --time-ms 2000 --strategies --aura --fill
+python3 build.py pack --in examples/synthetic/order_10.txt --out out/r.json time_ms=3000
+python3 build.py synthetic        # 重新生成 examples/synthetic（仓库里已有，不必跑）
+python3 build.py pool             # 重新生成 examples/pool
 ```
 
-`scripts/aura.sh` 会在没设 `AURA_PATH` 时按 `AURA_RUNTIME_DIR/lib` 设置，否则 `std/process` 等标准库找不到。开发时用 `ulimit -v 4000000` 给 aura 设内存上限。
+`python3 build.py --help` 列出全部子命令。`--debug` 改成 `-O0 -g`，`--force` 强制重编，`CXX` / `CXXFLAGS` 传给编译器。
 
-（Aura 的 stdout 在管道下是块缓冲，所以用 `script -qc` 给它一个 pty。）
+Aura 部分需要 `aura` 可执行文件（开发时用的是 `ghcr.io/cybrid-systems/dev:v1.0.9` 镜像和 aura `69d360068`），用 `AURA_BIN` 指过去。`scripts/aura.sh` 会设 `AURA_SANDBOX=off` 和 `AURA_PIPELINE_STRICT=0`，并在没设 `AURA_PATH` 时用 `AURA_RUNTIME_DIR/lib`（否则 `std/process` 等标准库找不到）。开发时用 `ulimit -v 4000000` 给 aura 设内存上限。Aura 的 stdout 在管道下是块缓冲，`build.py aura` 用 `script -qc` 给它一个 pty。
 
 ### 真实数据（只在本地）
 
 ```bash
 export PEICANG_DATA=/path/outside/repo          # 放 xlsx / csv / zip
-python3 tools/import_xlsx.py inspect             # 只打印表结构和字段映射，不打印内容
-python3 tools/import_xlsx.py convert --out out/real [--map mapping.json] \
+python3 build.py import inspect                  # 只打印表结构和字段映射，不打印内容
+python3 build.py import convert --out out/real [--map mapping.json] \
     [--group auto|order|sheet] [--existing-type 45HC] [--est-dims]
-python3 tools/bench.py --orders out/real --out out/bench-real --aura
+python3 build.py bench --orders out/real --out out/bench-real --aura
 ```
 
 导入器把 SKU / 客户 / 单号匿名化为 `real_XX_YYY`；如果表里带有现有装柜记录（柜号/柜型），`bench.py` 会多出"现有方案"对比一行——这才是验证 10–18% 的正确方式。导入假设：毛重按单箱计、卸货站顺序按目的地首次出现顺序、缺"可倒置"列时按只能直立处理；与实际表头不符时用 `--map` 指定。

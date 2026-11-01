@@ -3,8 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 J=${J:-$(nproc)}
-mkdir -p build out/test
-g++ -O2 -std=c++20 -Wall -Werror -o build/pack kernel/pack.cpp
+mkdir -p out/test
+python3 build.py
 python3 tools/gen_synthetic.py --orders 4 --seed 101 --out out/test/orders >/dev/null
 fail=0
 # 1) kernel: every plan must pass the independent checker
