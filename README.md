@@ -364,10 +364,10 @@ ep 有 2 单违反危险品间距，判为不可执行；它在可执行题上�
 
 ## v0.2 下游验证（P9，仅合成数据）
 
-把 8 个构造 Agent、拼柜 nf/ff/ffd/LNS、MOEA/D、NSGA-II 登记进 aura `std/portfolio`，用 `select:offline` 按特征选 4 个候选，`alloc "successive-halving"` 在同等总预算下淘汰，`tune:gate` 做多 seed 配对门禁，EoH 提案在隔离 worldline 里评估；另加 `slotting/` 合成货位分配（7 个成员 + `select:offline` 选择器 + 事后 oracle/clairvoyant 上界）。数字只来自合成订单（训练 12 单 `examples/synthetic` + 留出 12 单 `examples/holdout-synthetic`，5 个 seed）。
+把 8 个构造 Agent、拼柜 nf/ff/ffd/LNS、MOEA/D、NSGA-II 登记进 aura `std/portfolio`，用 `select:offline` 按特征选 4 个候选，`alloc "successive-halving"` 在同等总预算下淘汰，`tune:gate` 做多 seed 配对门禁，EoH 提案在隔离 worldline 里评估；另加 `slotting/` 合成货位分配：两类**结构互补**的订单族（`bulk` 长重套件对 / `basket` 多小件同组篮，共位要求互相冲突）、10 个成员（turn/abc/aff/prs + EoH-S 3 + 局部搜索 2 + `moead`）、`select:offline` 选择器、事后 oracle/clairvoyant 上界；判据是**每族配对中位数 + bootstrap 95% CI**，最差族 5 个留出 seed 为 +15.0%…+32.5%（均值 +26.8%，5/5 CI 下界 > 0）。B3 的前端是 Aura `std/moead` 的 ask/tell（`slotting/moead_host.aura` + `moead_bridge.py`），MOEA/D 配置作为成员进入组合。数字只来自合成订单（训练 12 单 `examples/synthetic` + 留出 12 单 `examples/holdout-synthetic`，5 个 seed）。
 
 - 报告：[`docs/v02-downstream-report.md`](docs/v02-downstream-report.md)（声明 → 测试 → 结果，失败项如实列出）
-- Aura pin：`99ddc81c9`；运行需要 `AURA_PATH=<aura 源码>/lib`
+- Aura pin：`99ddc81c9`；运行需要 `AURA_PATH=<aura 源码>/lib`（slotting 的 B3 前端另需 `AURA_BIN=<aura>/build/aura`）
 - 命令：
 
 ```bash
@@ -375,7 +375,7 @@ python3 build.py
 AURA_PATH=/path/to/aura/lib tools/portfolio_v02.sh all   # 矩阵/选择淘汰/拼柜/EoH/MOO
 python3 slotting/gen_slotting.py --seed 7 --out slotting/data/s7.json
 python3 slotting/run_slotting.py --seeds 7,11,13,17,19 --out slotting/out/run.json
-python3 tests/test_slotting.py                             # 成本模型 / 约束 / EoH-S / 选择器 / 协议
+python3 tests/test_slotting.py                             # 成本模型 / 约束 / 订单族互补 / 选择器 / B1 判据 / B3
 python3 tools/portfolio_report.py --root out/v02
 tools/v02_smoke.sh                                       # CI 冒烟（约 1 分钟）
 ```

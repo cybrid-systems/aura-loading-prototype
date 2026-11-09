@@ -1,0 +1,81 @@
+; slotting/moead_host.aura -- std/moead ask/tell as a line service (#4947 B3).
+;
+; Aura owns the MOEA/D state; the Python front-end owns the evaluation (it is the
+; only side that can score a slotting genome).  One JSON-free line protocol:
+;
+;   MAKE <n-obj> <H> <T> <dim> <seed> <lo0> <hi0> ...   -> OK <n-weights>
+;   ASK <k>                                             -> CANDS <n> then n lines
+;                                                          <slot> <gen> <g0> ...
+;   TELL <n> then n lines of objective vectors          -> OK
+;   BYE                                                 -> BYE
+;
+; Run it with the Aura standard library on the path:
+;   AURA_PATH=/path/to/aura/lib python3 slotting/moead_bridge.py --selftest
+(require "std/moead" all:)
+(require "std/io" all:)
+(require "std/string" all:)
+(require "std/list" all:)
+
+(define (say x) (display x) (newline))
+
+(define (fmt xs)
+  (string-join (map (lambda (v)
+                      (number->string (exact->inexact v)))
+                    xs)
+               " "))
+
+(define (mk-bounds flat)
+  (let loop ((p flat) (acc (list)))
+    (if (or (null? p) (null? (cdr p)))
+        (reverse acc)
+        (loop (cddr p) (cons (list (car p) (cadr p)) acc)))))
+
+(define (words line)
+  (filter (lambda (x) (not (string=? x ""))) (string-split line " ")))
+
+(define (main)
+  (let* ((port (current-input-port))
+         (dummy (moead:make (hash "n-obj" 2 "H" 4 "T" 3 "operator" "rand" "dim" 1
+                                  "bounds" (list (list 0.0 1.0))))))
+    (let loop ((s dummy) (last (list)))
+      (let ((line (read-line port)))
+        (if (eof-object? line)
+            (begin (say "EOF") #t)
+            (let* ((w (words line))
+                   (cmd (if (null? w) "" (car w)))
+                   (nums (map string->number (cdr w))))
+              (cond
+                ((string=? cmd "MAKE")
+                 (let* ((nobj (car nums)) (h (cadr nums)) (t (caddr nums))
+                        (dim (list-ref nums 3)) (seed (list-ref nums 4))
+                        (flat (list-tail nums 5))
+                        (s2 (moead:make (hash "n-obj" nobj "H" h "T" t "dim" dim
+                                              "seed" seed "operator" "rand"
+                                              "bounds" (mk-bounds flat)))))
+                   (say (string-append "OK " (number->string (length (moead:weights s2)))))
+                   (loop s2 (list))))
+                ((string=? cmd "ASK")
+                 (let* ((k (car nums)) (cs (moead:ask s k)))
+                   (say (string-append "CANDS " (number->string (length cs))))
+                   (for-each (lambda (c)
+                               (say (string-append
+                                     (number->string (hash-ref c "slot" 0)) " "
+                                     (number->string (hash-ref c "gen" 0)) " "
+                                     (number->string (hash-ref (hash-ref c "meta" (hash)) "sub" 0)) " "
+                                     (fmt (hash-ref c "genome" (list))))))
+                             cs)
+                   (loop s cs)))
+                ((string=? cmd "TELL")
+                 (let ((n (car nums)))
+                   (let tell ((i 0) (objs (list)))
+                     (if (>= i n)
+                         (begin (moead:tell! s last (reverse objs))
+                                (say "OK")
+                                (loop s (list)))
+                         (tell (+ i 1)
+                               (cons (map string->number (words (read-line port)))
+                                     objs))))))
+                ((string=? cmd "BYE") (say "BYE") #t)
+                (else (say "ERR unknown") (loop s last)))))))))
+
+(main)

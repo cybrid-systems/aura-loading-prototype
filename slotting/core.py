@@ -190,6 +190,80 @@ def assign_affinity(weights, data):
     return place(data, order)
 
 
+def assign_pairs(weights, data, min_aff=0.8):
+    """Co-purchase pair packing: trust the strongest affinity edges.
+
+    Greedy maximum matching over the affinity matrix (strongest edge first),
+    then each matched pair gets two adjacent slots in the prime (low-x) area
+    and everything else is placed by demand.  Pairs inside one group behave
+    like the affinity constructor; pairs that span groups are the case the
+    group-contiguous constructor cannot express.
+    """
+    edges = []
+    for key, val in data["affinity"].items():
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            continue
+        if v >= min_aff:
+            a, b = key.split("-")
+            edges.append((v, int(a), int(b)))
+    edges.sort(key=lambda e: (-e[0], e[1], e[2]))
+    used, pairs = set(), []
+    for _, a, b in edges:
+        if a in used or b in used:
+            continue
+        used.update((a, b))
+        pairs.append((a, b))
+    pairs.sort(key=lambda p: -(weights[p[0]] + weights[p[1]]))
+    order = []
+    for a, b in pairs:
+        if weights[a] < weights[b]:
+            a, b = b, a
+        order.extend((a, b))
+    order.extend(sorted((i for i in range(len(data["skus"])) if i not in used),
+                        key=lambda i: -weights[i]))
+    return place(data, order)
+
+
+def place_biased(data, priority, beta=None):
+    """Greedy along x + a per-aisle slot offset (MOEA/D genomes, B3).
+
+    beta[a] shifts every slot of aisle a by that many metres, so a genome can
+    trade travel (front aisles first) against aisle-load balance (spread the
+    picks out) without leaving the same greedy construction.
+    """
+    slots = data["slots"]
+    beta = beta or [0.0] * data["layout"]["aisles"]
+    order = sorted(range(len(slots)),
+                   key=lambda s: (slots[s]["x"] + beta[slots[s]["aisle"]],
+                                  slots[s]["level"]))
+    used = set()
+    out = [-1] * len(data["skus"])
+    for i in priority:
+        for s in order:
+            if s in used or not fits(slots[s], data["skus"][i]):
+                continue
+            out[i] = s
+            used.add(s)
+            break
+    return out
+
+
+def assign_biased(weights, data, p=1.0, q=0.0, r=0.0, beta=None):
+    """Priority family of assign_weighted, plus per-aisle slot bias."""
+    skus = data["skus"]
+    gmass = {}
+    for i, k in enumerate(skus):
+        gmass[k["group"]] = gmass.get(k["group"], 0.0) + weights[i]
+
+    def score(i):
+        return -((weights[i] ** p) * ((skus[i]["m3"] + 1e-6) ** q)
+                 * ((gmass[skus[i]["group"]] + 1e-6) ** r))
+
+    return place_biased(data, sorted(range(len(skus)), key=score), beta)
+
+
 def assign_weighted(weights, data, p=1.0, q=0.0, r=0.0):
     """EoH-S family: priority = -(w^p * m3^q * group_mass^r)."""
     skus = data["skus"]

@@ -31,9 +31,25 @@ def tv(a, b):
     return 0.5 * sum(abs(x - y) for x, y in zip(a, b))
 
 
-def window_features(weights, prev_weights):
-    return dict(entropy=entropy(weights), top10=top_share(weights),
-                tv=tv(weights, prev_weights) if prev_weights else 0.0)
+def window_features(weights, prev_weights, window=None):
+    """Forecast features of one window.
+
+    `window` is the forecast's order-structure block (size range, sampler,
+    cohesion).  It is visible before the week starts, so using it is causal; it
+    is what lets the selector learn "baskets want the affinity member, pallet
+    picks want the pair packer" instead of guessing from the demand vector
+    alone.
+    """
+    wf = dict(entropy=entropy(weights), top10=top_share(weights),
+              tv=tv(weights, prev_weights) if prev_weights else 0.0)
+    size, coh, grp = 3.0, 0.0, 0.0
+    if window:
+        lo, hi = window.get("size", (1, 5))
+        size = 0.5 * (lo + hi)
+        coh = float(window.get("cohesion", 0.0))
+        grp = 1.0 if window.get("sampler") in ("grouped", "paired") else 0.0
+    wf.update(size=size / 10.0, cohesion=coh, structure=grp)
+    return wf
 
 
 class OfflineSelector:
@@ -52,7 +68,10 @@ class OfflineSelector:
         r = pred / best_pred if best_pred else 1.0
         onehot = [1.0 if i == idx else 0.0 for i in range(k)]
         return ([1.0, r, pred_cvar / best_pred if best_pred else 1.0,
-                 wf["tv"], wf["entropy"], wf["top10"], r * wf["tv"]] + onehot)
+                 wf["tv"], wf["entropy"], wf["top10"], r * wf["tv"],
+                 wf.get("size", 0.3), wf.get("cohesion", 0.0),
+                 wf.get("structure", 0.0),
+                 r * wf.get("size", 0.3), r * wf.get("cohesion", 0.0)] + onehot)
 
     # ---- fitting ---------------------------------------------------------
     def fit(self, rows):
