@@ -1,168 +1,69 @@
 #!/usr/bin/env python3
-"""Synthetic warehouse slotting: objectives, members, rolling-window online selection.
+"""Synthetic warehouse slotting: rolling portfolio with a learned selector.
 
-  python3 slotting/run_slotting.py --seed 7 --out slotting/out/s7.json [--windows 52]
+Part B of #4947.  No real data: every number comes from slotting/gen_slotting.py.
 
-Part B of #4947.  No real data: everything comes from slotting/gen_slotting.py.
-Members (Python, stdlib only):
-  abc        volume-priority placement
-  turnover   pick-frequency-priority placement
-  affinity   co-purchase cluster placement
-  ls         local search (swap) from the turnover assignment
-The online policy is a rolling window that scores each member on the last
-window, detects a demand-structure drift (total-variation distance), and
-switches within the next window.  MOEA/D-lite (Tchebycheff, 12 directions)
-is run once on the peak window to expose the distance/aisle-variance front.
+Protocol (the part the first round got wrong):
+
+  * At the start of window w a policy only knows that window's *forecast*
+    demand distribution (windows[w].weights).  It plans on --plan-samples orders
+    sampled from that forecast; the assignment is deployed inside w.  The first
+    round planned with the window's realised orders and deployed them one
+    window late, so it both leaked information and threw a window away.
+  * Cost of a window = mean order travel on the window's realised orders.
+
+Policies (see docs/v02-downstream-report.md for the numbers):
+
+  sbs_static    week-0 assignment of the best member, frozen for all windows
+                (the comparator the first round used; kept for continuity)
+  sbs_roll      the best single member, replanned each window with budget B
+  portfolio_eq  members share B total (successive halving) + select:offline
+  portfolio     each member gets the full B (no compute parity) + select:offline
+  oracle        per-window argmin over the portfolio's assignments (hindsight:
+                upper bound on what *selection* could add)
+  clairvoyant   per-window optimum on the realised orders (hindsight: upper
+                bound on what *any* assignment could add)
+
+  python3 slotting/run_slotting.py --seed 7 --out slotting/out/s7.json
+  python3 slotting/run_slotting.py --seeds 7,11,13,17,19 --summary
 """
-import argparse, json, math, random, statistics
+import argparse
+import json
+import os
+import random
+import statistics
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import core
+import eoh_s
+import gen_slotting
+import selector as sel_mod
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TRAIN_SEEDS = (31, 37, 43)
+BUDGET = 1500
+PLAN_SAMPLES = 800
+DRIFT_TV = 0.12
+SWITCH_MARGIN = 0.01          # predicted-gap improvement required to switch
+MEMBER_ID = {"turn": 0, "abc": 1, "aff": 2, "eoh1": 3, "eoh2": 4, "eoh3": 5,
+             "ls_turn": 6, "ls_abc": 7, "ls_eoh1": 8, "ls_eoh2": 9, "ls_eoh3": 10}
 
 
-def fits(slot, sku):
-    if sku["hazmat"] != (slot["aisle"] == 5):
-        return False
-    if sku["kg"] > 25 and slot["level"] == 2:
-        return False
-    if sku["m3"] > slot["cap_m3"] or sku["kg"] > slot["cap_kg"]:
-        return False
-    return True
+# ---------------------------------------------------------------------------
+# synthetic instance + demand sampling
+# ---------------------------------------------------------------------------
+def get_data(seed):
+    """Synthetic instance for `seed`: the JSON if present, else the generator
+    (deterministic, identical content)."""
+    path = os.path.join(ROOT, "slotting", "data", "s%d.json" % seed)
+    if os.path.exists(path):
+        return core.load(path)
+    return gen_slotting.build(seed)
 
 
-def assign_priority(order, data):
-    slots, skus = data["slots"], data["skus"]
-    free = sorted(range(len(slots)), key=lambda s: (slots[s]["x"], slots[s]["level"]))
-    used, out = set(), [-1] * len(skus)
-    for i in order:
-        for s in free:
-            if s in used:
-                continue
-            if fits(slots[s], skus[i]):
-                out[i] = s
-                used.add(s)
-                break
-    return out
-
-
-def assign_affinity(weights, data):
-    slots, skus = data["slots"], data["skus"]
-    groups = {}
-    for i, k in enumerate(skus):
-        groups.setdefault(k["group"], []).append(i)
-    order = []
-    for g, members in sorted(groups.items(), key=lambda kv: -sum(weights[i] for i in kv[1])):
-        order.extend(sorted(members, key=lambda i: -weights[i]))
-    return assign_priority(order, data)
-
-
-def window_orders(data, w, seed):
-    rng = random.Random(seed * 1000 + w)
-    ws = data["windows"][w]
-    n = ws["orders"]
-    cum, acc = [], 0.0
-    for x in ws["weights"]:
-        acc += x
-        cum.append(acc)
-    orders = []
-    for _ in range(n):
-        k = rng.randint(1, 5)
-        o = []
-        for _ in range(k):
-            r = rng.random() * acc
-            lo, hi = 0, len(cum) - 1
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if cum[mid] < r:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            o.append(lo)
-        orders.append(o)
-    return orders
-
-
-def travel(assign, orders, data):
-    slots = data["slots"]
-    tot = 0.0
-    for o in orders:
-        xs = sorted({slots[assign[i]]["x"] for i in o if assign[i] >= 0})
-        if not xs:
-            continue
-        tot += 2.0 * xs[-1] + sum(xs[k] - xs[k - 1] for k in range(1, len(xs)))
-    return tot / max(1, len(orders))
-
-
-def aisle_load(assign, orders, data):
-    slots = data["slots"]
-    cnt = [0.0] * data["layout"]["aisles"]
-    for o in orders:
-        for i in o:
-            if assign[i] >= 0:
-                cnt[slots[assign[i]]["aisle"]] += 1
-    return cnt
-
-
-def objectives(assign, orders, data):
-    dist = travel(assign, orders, data)
-    load = aisle_load(assign, orders, data)
-    tot = sum(load) or 1.0
-    vari = statistics.pvariance([x / tot for x in load])
-    aff = 0.0
-    slots = data["slots"]
-    n = 0
-    for key, v in data["affinity"].items():
-        i, j = (int(x) for x in key.split("-"))
-        if assign[i] >= 0 and assign[j] >= 0:
-            aff += v * abs(slots[assign[i]]["x"] - slots[assign[j]]["x"])
-            n += 1
-    return dict(distance=round(dist, 3), aisle_var=round(vari, 6),
-                affinity=round(aff / max(1, n), 3), violations=violations(assign, data))
-
-
-def violations(assign, data):
-    slots, skus = data["slots"], data["skus"]
-    used, bad = {}, 0
-    for i, s in enumerate(assign):
-        if s < 0:
-            bad += 1
-            continue
-        used.setdefault(s, []).append(i)
-        if not fits(slots[s], skus[i]):
-            bad += 1
-    for s, items in used.items():
-        if sum(skus[i]["m3"] for i in items) > slots[s]["cap_m3"] + 1e-9:
-            bad += 1
-        if sum(skus[i]["kg"] for i in items) > slots[s]["cap_kg"] + 1e-9:
-            bad += 1
-    return bad
-
-
-def ls_improve(assign, weights, data, orders, iters=90, rng=None):
-    rng = rng or random.Random(1)
-    slots = data["slots"]
-    best = list(assign)
-    best_cost = travel(best, orders, data) + 0.05 * objectives(best, orders, data)["affinity"]
-    for _ in range(iters):
-        a, b = rng.randrange(len(best)), rng.randrange(len(best))
-        if a == b or best[a] == best[b]:
-            continue
-        cand = list(best)
-        cand[a], cand[b] = cand[b], cand[a]
-        if violations(cand, data) > 0:
-            continue
-        c = travel(cand, orders, data) + 0.05 * objectives(cand, orders, data)["affinity"]
-        if c < best_cost:
-            best, best_cost = cand, c
-    return best
-
-
-def member_assignments(weights, data, rng, orders=None):
-    abc = assign_priority(sorted(range(len(data["skus"])), key=lambda i: -weights[i] * data["skus"][i]["m3"]), data)
-    turn = assign_priority(sorted(range(len(data["skus"])), key=lambda i: -weights[i]), data)
-    aff = assign_affinity(weights, data)
-    ls = ls_improve(turn, weights, data, orders or window_orders(data, 0, 7), 140, rng)
-    return {"abc": abc, "turnover": turn, "affinity": aff, "ls": ls}
-
-
-def mock_orders_for(weights, data, rng, n=120):
+def sample_orders(weights, rng, n):
     cum, acc = [], 0.0
     for x in weights:
         acc += x
@@ -184,127 +85,347 @@ def mock_orders_for(weights, data, rng, n=120):
     return out
 
 
-def moead_lite(assign, data, orders, rng, dirs=12, iters=180):
-    """Tchebycheff-weighted 3-objective local search over swaps (no std/moead here;
-    the Aura-side MOEA/D is used for the packing problem)."""
-    vecs = []
-    for k in range(dirs):
-        t = k / (dirs - 1)
-        vecs.append((t + 0.01, 1.0 - t + 0.01, 0.3))
-    start = objectives(assign, orders, data)
-    ref = (start["distance"] * 1.1, start["aisle_var"] * 1.1 + 1e-9, start["affinity"] * 1.1 + 1e-9)
-    pts = [dict(distance=start["distance"], aisle_var=start["aisle_var"], affinity=start["affinity"])]
-    for wv in vecs:
-        best, bc = list(assign), None
-        for _ in range(iters):
-            a, b = rng.randrange(len(best)), rng.randrange(len(best))
-            if a == b or best[a] == best[b]:
-                continue
-            cand = list(best)
-            cand[a], cand[b] = cand[b], cand[a]
-            if violations(cand, data) > 0:
-                continue
-            o = objectives(cand, orders, data)
-            f = max(wv[0] * (o["distance"] / ref[0]), wv[1] * (o["aisle_var"] / ref[1]),
-                    wv[2] * (o["affinity"] / ref[2]))
-            if bc is None or f < bc:
-                best, bc = cand, f
-        o = objectives(best, orders, data)
-        pts.append(dict(distance=o["distance"], aisle_var=o["aisle_var"], affinity=o["affinity"]))
-    front = []
-    for p in pts:
-        dom = False
-        for q in pts:
-            if q is p:
-                continue
-            if (q["distance"] <= p["distance"] and q["aisle_var"] <= p["aisle_var"]
-                    and q["affinity"] <= p["affinity"]
-                    and (q["distance"] < p["distance"] or q["aisle_var"] < p["aisle_var"]
-                         or q["affinity"] < p["affinity"])):
-                dom = True
-                break
-        if not dom:
-            front.append(p)
-    return front
+def window_orders(data, w, seed):
+    """The window's realised orders (deterministic per seed/window)."""
+    ws = data["windows"][w]
+    return sample_orders(ws["weights"], random.Random(seed * 1000 + w), ws["orders"])
 
 
-def run(seed, windows=52):
-    data = json.load(open("slotting/data/s%d.json" % seed))
-    rng = random.Random(seed)
-    nw = min(windows, len(data["windows"]))
-    obs = [window_orders(data, w, seed) for w in range(nw)]
-    base = data["windows"][0]["weights"]
-
-    # SBS: a fixed assignment chosen at week 0, best worst-window distance
-    fixed = member_assignments(base, data, rng)
-    sbs = {}
-    for name, a in fixed.items():
-        vals = [travel(a, obs[w], data) for w in range(nw)]
-        sbs[name] = dict(worst=round(max(vals), 3), mean=round(statistics.fmean(vals), 3))
-
-    # online rolling window
-    hist = {k: [] for k in fixed}
-    deploy = fixed["ls"]
-    deployed = []
-    switch_week = None
-    switches = []
-    baseline = base
-    for w in range(nw):
-        weights = data["windows"][w]["weights"]
-        tv = 0.5 * sum(abs(weights[i] - baseline[i]) for i in range(len(weights)))
-        drift = tv > 0.12
-        cur = member_assignments(weights, data, rng, obs[w])
-        cur_scores = {k: travel(a, obs[w], data) for k, a in cur.items()}
-        if w == 0:
-            chosen = min(cur_scores, key=cur_scores.get)
-            deployed.append(travel(deploy, obs[w], data))
-        else:
-            if drift:
-                chosen = min(cur_scores, key=cur_scores.get)
-                if switch_week is None:
-                    switch_week = w + 1
-                switches.append(w + 1)
-            else:
-                means = {k: statistics.fmean(hist[k][-3:]) if hist[k] else 1e18 for k in hist}
-                chosen = min(means, key=means.get)
-            deployed.append(travel(prev_deploy, obs[w], data))
-        for k in hist:
-            hist[k].append(cur_scores[k])
-        prev_deploy = cur[chosen]
-        deploy = prev_deploy
-    worst_online = max(deployed)
-    best_sbs = min(v["worst"] for v in sbs.values())
-    best_name = min(sbs, key=lambda k: sbs[k]["worst"])
-
-    # MOEA/D-lite on the peak window
-    peak = 40 if nw > 40 else nw - 1
-    front = moead_lite(fixed["ls"], data, obs[peak], random.Random(seed + 99))
-    base_peak = objectives(fixed["ls"], obs[peak], data)
-    ok_var = False
-    for p in front:
-        if p["distance"] <= base_peak["distance"] and p["aisle_var"] <= 0.9 * base_peak["aisle_var"]:
-            ok_var = True
-    out = dict(seed=seed, windows=nw, sbs=sbs, best_sbs=best_name, sbs_worst=round(best_sbs, 3),
-               online_worst=round(worst_online, 3),
-               worst_improvement=round(1 - worst_online / best_sbs, 4),
-               switch_week=switch_week, switches=switches, drift_week=data["drift_week"],
-               deployed=[round(x, 3) for x in deployed],
-               peak_week=peak + 1, base_peak=base_peak,
-               moead_front=front, moead_points=len(front), moead_aisle_var_ok=ok_var)
+# ---------------------------------------------------------------------------
+# members
+# ---------------------------------------------------------------------------
+def greedy_members(weights, data, eoh_params):
+    out = dict(turn=core.assign_turnover(weights, data),
+               abc=core.assign_abc(weights, data),
+               aff=core.assign_affinity(weights, data))
+    for i, p in enumerate(eoh_params):
+        out["eoh%d" % (i + 1)] = eoh_s.assign(p, weights, data)
     return out
+
+
+def plan_window(data, w, eoh_params, budget, plan_n, seed, alloc="split"):
+    """Assignments for window w from the forecast only.
+
+    alloc="split": all LS members share `budget` (successive halving).
+    alloc="full":  every LS member gets the full `budget`.
+    """
+    weights = data["windows"][w]["weights"]
+    rng = random.Random(seed * 100003 + w)
+    plan = sample_orders(weights, rng, plan_n)
+    pc = core.Cost(data, plan)
+    base = greedy_members(weights, data, eoh_params)
+    ls_from = [n for n in ("turn", "abc") if n in base]
+    out = dict(base)
+    plan_cost = {n: pc.total(a) for n, a in base.items()}
+
+    def run(n, start, iters, tag):
+        r = random.Random(seed * 7919 + w * 31 + MEMBER_ID[n] * 7 + tag)
+        a, _ = core.local_search(start, pc, data, r, iters)
+        return a
+
+    if alloc == "full":
+        for n in ls_from:
+            a = run(n, base[n], budget, 1)
+            out["ls_" + n] = a
+            plan_cost["ls_" + n] = pc.total(a)
+    else:
+        stage1 = budget // 2
+        share = max(1, stage1 // len(ls_from))
+        first = {n: run(n, base[n], share, 1) for n in ls_from}
+        order = sorted(ls_from, key=lambda n: pc.total(first[n]))
+        survivors = order[:max(1, (len(order) + 1) // 2)]
+        left = budget - share * len(ls_from)
+        share2 = max(1, left // len(survivors))
+        for n in survivors:
+            a = run(n, first[n], share2, 2)
+            out["ls_" + n] = a
+            plan_cost["ls_" + n] = pc.total(a)
+
+    plan_cvar = {n: pc.cvar(a) for n, a in out.items()}
+    return out, plan_cost, plan_cvar
+
+
+def build_matrix(data, seed, nw, budget, plan_n, eoh_params, alloc):
+    rows = []
+    for w in range(nw):
+        assigns, pcost, pcvar = plan_window(data, w, eoh_params, budget, plan_n, seed, alloc)
+        c = core.Cost(data, window_orders(data, w, seed))
+        rows.append(dict(w=w, assigns=assigns, plan_cost=pcost, plan_cvar=pcvar,
+                         real={n: c.total(a) for n, a in assigns.items()}, cost=c))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# auxiliary checks
+# ---------------------------------------------------------------------------
+def paired_stats(a, b):
+    """Paired per-window difference (b - a; positive = `a` cheaper) vs zero."""
+    d = [x - y for x, y in zip(a, b)]
+    n = len(d)
+    m = statistics.fmean(d)
+    sd = statistics.stdev(d) if n > 1 else 0.0
+    se = sd / (n ** 0.5) if n > 1 else 0.0
+    return dict(mean_diff=round(m, 4), sd=round(sd, 4), se=round(se, 4),
+                t=round(m / se, 3) if se else None, wins=sum(1 for v in d if v < 0), n=n)
+
+def ls_variance(assign, cost, data, rng, iters, lam):
+    """Swap descent on mean travel + lam * aisle-load variance (B3 probe)."""
+    best = list(assign)
+    bc = cost.total(best) + lam * cost.aisle_var(best)
+    slots, skus = data["slots"], data["skus"]
+    for _ in range(iters):
+        x, y = rng.randrange(len(best)), rng.randrange(len(best))
+        if x == y or best[x] == best[y]:
+            continue
+        if not core.fits(slots[best[y]], skus[x]) or not core.fits(slots[best[x]], skus[y]):
+            continue
+        cand = list(best)
+        cand[x], cand[y] = cand[y], cand[x]
+        v = cost.total(cand) + lam * cost.aisle_var(cand)
+        if v < bc:
+            best, bc = cand, v
+    return best
+
+
+def b3_check(data, peak_w, base, plan_cost, real_cost, seed, iters=1200):
+    """Causal distance / aisle-variance trade-off on the peak window.
+
+    Candidates are optimised on a forecast plan sample (`plan_cost`) and scored
+    on the window's realised orders (`real_cost`) -- no hindsight.
+    """
+    b = dict(distance=round(real_cost.total(base), 3), aisle_var=round(real_cost.aisle_var(base), 6))
+    pts = []
+    for lam in (0.0, 2.0, 5.0, 10.0, 20.0, 50.0):
+        a = ls_variance(base, plan_cost, data, random.Random(seed * 613 + int(lam)), iters, lam)
+        pts.append(dict(lam=lam, distance=round(real_cost.total(a), 3),
+                        aisle_var=round(real_cost.aisle_var(a), 6)))
+    ok = any(p["distance"] <= b["distance"] * 1.0001 and p["aisle_var"] <= 0.9 * b["aisle_var"] for p in pts)
+    return dict(base=b, points=pts, ok=ok, week=peak_w + 1)
+
+
+def noise_probe(data, seed, w, assign, rounds=12, n=260, big=4000):
+    """Realised vs expected cost of one assignment at one window.
+
+    The window cost in this scenario is a single draw of `n` orders, so the
+    "worst window" carries sampling noise; this probe measures it directly."""
+    wt = data["windows"][w]["weights"]
+    realised = core.Cost(data, window_orders(data, w, seed)).total(assign)
+    expected = core.Cost(data, sample_orders(wt, random.Random(seed * 77 + w), big)).total(assign)
+    vals = [core.Cost(data, sample_orders(wt, random.Random(seed * 911 + w * 7 + k), n)).total(assign)
+            for k in range(rounds)]
+    sd = statistics.stdev(vals)
+    return dict(week=w + 1, realised=round(realised, 3), expected=round(expected, 3),
+                bias_frac=round(realised / expected - 1, 4),
+                sd=round(sd, 3), sd_frac=round(sd / expected, 4), n=n, rounds=rounds)
+
+
+# ---------------------------------------------------------------------------
+# select:offline training
+# ---------------------------------------------------------------------------
+_SEL_CACHE = {}
+_EOH_CACHE = {}
+
+
+def common_names(rows):
+    """Members present in every window (successive halving drops some of them)."""
+    names = set(rows[0]["real"])
+    for r in rows[1:]:
+        names &= set(r["real"])
+    return sorted(names)
+
+
+def train_selector(train_seeds, nw, budget, plan_n, eoh_params, alloc="split"):
+    key = (tuple(train_seeds), nw, budget, plan_n, alloc,
+           tuple(sorted((p["p"], p["q"], p["r"]) for p in eoh_params)))
+    if key in _SEL_CACHE:
+        return _SEL_CACHE[key]
+    rows, sel = [], None
+    names = None
+    for ts in train_seeds:
+        data = get_data(ts)
+        n = min(nw, len(data["windows"]))
+        mat = build_matrix(data, ts, n, budget, plan_n, eoh_params, alloc)
+        names = common_names(mat)
+        if sel is None:
+            sel = sel_mod.OfflineSelector(names)
+        prev = None
+        for w in range(n):
+            f = sel_mod.window_features(data["windows"][w]["weights"], prev)
+            prev = data["windows"][w]["weights"]
+            r = mat[w]
+            best_real = min(r["real"].values())
+            best_pred = min(r["plan_cost"].values())
+            for nm in names:
+                x = sel.vector(nm, r["plan_cost"][nm], r["plan_cvar"][nm], best_pred, f)
+                y = (r["real"][nm] - best_real) / best_real if best_real else 0.0
+                rows.append((x, y))
+    sel.fit(rows)
+    _SEL_CACHE[key] = sel
+    return sel
+
+
+def select_series(rows, weights_series, sel, names):
+    """Per-window member choice with a switch margin (hysteresis)."""
+    picks, series, prev_choice, tv = [], [], None, []
+    base = weights_series[0]
+    for w, r in enumerate(rows):
+        f = sel_mod.window_features(weights_series[w], weights_series[w - 1] if w else None)
+        tv.append(0.5 * sum(abs(a - b) for a, b in zip(weights_series[w], base)))
+        best_pred = min(r["plan_cost"].values())
+        feats = [(n, sel.vector(n, r["plan_cost"][n], r["plan_cvar"][n], best_pred, f)) for n in names]
+        preds = {n: sel.predict(x) for n, x in feats}
+        choice = min(preds, key=preds.get)
+        if prev_choice is not None and choice != prev_choice:
+            if preds[prev_choice] - preds[choice] <= SWITCH_MARGIN:
+                choice = prev_choice
+        picks.append(choice)
+        series.append(r["real"][choice])
+        prev_choice = choice
+    return picks, series, tv
+
+
+# ---------------------------------------------------------------------------
+# one seed
+# ---------------------------------------------------------------------------
+def run(seed, windows=52, budget=BUDGET, plan_n=PLAN_SAMPLES, clair_iters=4000, verbose=False):
+    data = get_data(seed)
+    nw = min(windows, len(data["windows"]))
+    train_seeds = tuple(s for s in TRAIN_SEEDS if s != seed)
+
+    # EoH-S on training windows only (a different synthetic seed); it is
+    # expensive and identical for every evaluation seed, so cache it.
+    ekey = (train_seeds, nw, plan_n)
+    if ekey not in _EOH_CACHE:
+        train = []
+        for ts in train_seeds:
+            d = get_data(ts)
+            for w in range(0, min(nw, len(d["windows"])), 4):
+                weights = d["windows"][w]["weights"]
+                train.append((d, weights,
+                              core.Cost(d, sample_orders(weights, random.Random(ts * 31 + w), plan_n))))
+        _EOH_CACHE[ekey] = eoh_s.evolve(train, seed=0, gens=4, pop=8)
+    kept, audit = _EOH_CACHE[ekey]
+    eoh_params = [p for p, _ in kept]
+
+    weights_series = [data["windows"][w]["weights"] for w in range(nw)]
+
+    # full-budget matrix: sbs_roll / oracle / portfolio(no parity) / clairvoyant
+    full = build_matrix(data, seed, nw, budget, plan_n, eoh_params, "full")
+    names = sorted(full[0]["real"])
+
+    sbs_roll = {n: max(r["real"][n] for r in full) for n in names}
+    best = min(sbs_roll, key=sbs_roll.get)
+    w0 = full[0]["assigns"]
+    static = {n: max(full[w]["cost"].total(w0[n]) for w in range(nw)) for n in names}
+    best_static = min(static, key=static.get)
+
+    sel_full = train_selector(train_seeds, nw, budget, plan_n, eoh_params, "full")
+    picks_full, port_full, _ = select_series(full, weights_series, sel_full, names)
+    oracle = [min(r["real"].values()) for r in full]
+
+    clair = []
+    for r in full:
+        start = r["assigns"][min(r["real"], key=r["real"].get)]
+        a, _ = core.local_search(start, r["cost"], data, random.Random(seed * 17 + r["w"]), clair_iters)
+        clair.append(r["cost"].total(a))
+
+    # equal-total-budget matrix: portfolio_eq
+    eq = build_matrix(data, seed, nw, budget, plan_n, eoh_params, "split")
+    eq_names = common_names(eq)
+    sel_eq = train_selector(train_seeds, nw, budget, plan_n, eoh_params, "split")
+    picks_eq, port_eq, tv = select_series(eq, weights_series, sel_eq, eq_names)
+
+    # binding window for sbs_roll: used by the noise probe and the B3 probe
+    bind_w = max(range(nw), key=lambda w: full[w]["real"][best])
+    probe = noise_probe(data, seed, bind_w, full[bind_w]["assigns"][best])
+    peak = min(nw - 1, 39)
+    peak_plan = core.Cost(data, sample_orders(data["windows"][peak]["weights"],
+                                              random.Random(seed * 100003 + peak), plan_n))
+    b3 = b3_check(data, peak, full[peak]["assigns"][best], peak_plan, full[peak]["cost"], seed)
+
+    drift_weeks = [w + 1 for w in range(nw) if tv[w] > DRIFT_TV]
+    injected = data.get("drift_week", 27) + 1
+    switches = [w + 1 for w in range(1, nw) if picks_full[w] != picks_full[w - 1]]
+
+    out = dict(
+        seed=seed, windows=nw,
+        sbs_roll=dict(best=best, worst=round(sbs_roll[best], 3),
+                      per_member={k: round(v, 3) for k, v in sbs_roll.items()}),
+        sbs_static=dict(best=best_static, worst=round(static[best_static], 3),
+                        per_member={k: round(v, 3) for k, v in static.items()}),
+        portfolio=dict(worst=round(max(port_full), 3), mean=round(statistics.fmean(port_full), 3),
+                       picks=picks_full, switch_week=switches[0] if switches else None,
+                       switches=switches),
+        portfolio_eq=dict(worst=round(max(port_eq), 3), mean=round(statistics.fmean(port_eq), 3),
+                          picks=picks_eq),
+        oracle=dict(worst=round(max(oracle), 3), mean=round(statistics.fmean(oracle), 3)),
+        clairvoyant=dict(worst=round(max(clair), 3)),
+        drift=dict(threshold=DRIFT_TV, first_drift_week=drift_weeks[0] if drift_weeks else None,
+                   injected_week=injected,
+                   adapt_lag=(drift_weeks[0] - injected) if drift_weeks else None),
+        gain=dict(
+            portfolio_vs_roll=round(1 - max(port_full) / sbs_roll[best], 4),
+            portfolio_eq_vs_roll=round(1 - max(port_eq) / sbs_roll[best], 4),
+            vs_sbs_static=round(1 - max(port_full) / static[best_static], 4),
+            selection_headroom=round(1 - max(oracle) / sbs_roll[best], 4),
+            clairvoyant_headroom=round(1 - max(clair) / sbs_roll[best], 4),
+        ),
+        series=dict(portfolio=[round(x, 3) for x in port_full],
+                    portfolio_eq=[round(x, 3) for x in port_eq],
+                    sbs_roll=[round(full[w]["real"][best], 3) for w in range(nw)],
+                    oracle=[round(x, 3) for x in oracle]),
+        binding_window=bind_w + 1,
+        noise_probe=probe,
+        b3=b3,
+        paired=paired_stats(port_full, [full[w]["real"][best] for w in range(nw)]),
+        eoh=dict(params=eoh_params, audit=audit),
+        protocol=dict(budget=budget, plan_samples=plan_n, drift_tv=DRIFT_TV,
+                      switch_margin=SWITCH_MARGIN, train_seeds=list(train_seeds),
+                      clair_iters=clair_iters),
+        members=names,
+    )
+    return out
+
+
+def summary(results):
+    print("seed  SBS_static  SBS_roll  port_eq   port    oracle  clair   port/roll  port_eq/roll  sel_head  clair_head  switch  adapt  bind_wk  noise(sd%)")
+    for r in results:
+        print("%4d  %10.2f  %8.2f  %7.2f  %7.2f  %7.2f  %6.2f  %+9.2f%%  %+12.2f%%  %+8.2f%%  %+10.2f%%  %6s  %5s  %7d  %+9.2f"
+              % (r["seed"], r["sbs_static"]["worst"], r["sbs_roll"]["worst"], r["portfolio_eq"]["worst"],
+                 r["portfolio"]["worst"], r["oracle"]["worst"], r["clairvoyant"]["worst"],
+                 100 * r["gain"]["portfolio_vs_roll"], 100 * r["gain"]["portfolio_eq_vs_roll"],
+                 100 * r["gain"]["selection_headroom"], 100 * r["gain"]["clairvoyant_headroom"],
+                 str(r["portfolio"]["switch_week"]), str(r["drift"]["adapt_lag"]),
+                 r["binding_window"], 100 * r["noise_probe"]["sd_frac"]))
+    if len(results) > 1:
+        avg = lambda k: 100 * statistics.fmean(r["gain"][k] for r in results)
+        print("mean: portfolio/roll %+.2f%%  portfolio_eq/roll %+.2f%%  selection_headroom %+.2f%%  clairvoyant %+.2f%%"
+              % (avg("portfolio_vs_roll"), avg("portfolio_eq_vs_roll"),
+                 avg("selection_headroom"), avg("clairvoyant_headroom")))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--seeds", default="")
     ap.add_argument("--windows", type=int, default=52)
+    ap.add_argument("--budget", type=int, default=BUDGET)
+    ap.add_argument("--plan-samples", type=int, default=PLAN_SAMPLES)
+    ap.add_argument("--clair-iters", type=int, default=4000)
     ap.add_argument("--out", default="slotting/out/run.json")
+    ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
-    import os
+    seeds = [int(x) for x in a.seeds.split(",") if x.strip()] or [a.seed]
+    results = [run(s, a.windows, a.budget, a.plan_samples, a.clair_iters) for s in seeds]
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    r = run(a.seed, a.windows)
-    json.dump(r, open(a.out, "w"), indent=1)
-    print(json.dumps({k: r[k] for k in ("seed", "sbs_worst", "online_worst", "worst_improvement", "switch_week")}))
+    json.dump(results[0] if len(results) == 1 else results, open(a.out, "w"), indent=1)
+    if not a.quiet:
+        summary(results)
+        for r in results:
+            print("seed %d: members %s | eoh kept %d | drift wk %s (injected %s) | switch wk %s"
+                  % (r["seed"], ",".join(r["members"]), len(r["eoh"]["params"]),
+                     r["drift"]["first_drift_week"], r["drift"]["injected_week"],
+                     r["portfolio"]["switch_week"]))
 
 
 if __name__ == "__main__":

@@ -18,6 +18,14 @@ test -s out/smoke/nf.json && echo "ok   pc_eval nf"
 python3 tools/verify.py out/smoke/wall.json >/dev/null && echo "ok   pc_eval wall feasible"
 python3 tools/portfolio_merge.py --help >/dev/null
 python3 slotting/gen_slotting.py --seed 3 --out slotting/data/s3.json >/dev/null
-timeout 120 python3 slotting/run_slotting.py --seed 3 --windows 8 --out out/smoke/slot-run.json >/dev/null
+python3 tests/test_slotting.py >/dev/null && echo "ok   slotting tests"
+timeout 180 python3 slotting/run_slotting.py --seed 3 --windows 8 --budget 200 --plan-samples 150 \
+  --clair-iters 200 --out out/smoke/slot-run.json --quiet
+python3 - <<'PY'
+import json
+r = json.load(open("out/smoke/slot-run.json"))
+assert r["oracle"]["worst"] <= r["sbs_roll"]["worst"] + 1e-9
+assert r["clairvoyant"]["worst"] <= r["oracle"]["worst"] + 1e-9
+PY
 echo "ok   slotting skeleton"
 echo "@@smoke done"

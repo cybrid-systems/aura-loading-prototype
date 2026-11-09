@@ -149,4 +149,16 @@ PC_CONS_GROUPS=out/test/cons-groups.json PC_OUT=out/test/cons-aura PC_CONS_TIME_
   script -qc "scripts/aura.sh aura/consolidate-main.aura" /dev/null > out/test/cons-aura.log 2>&1 || true
 if grep -q "@@done=ok" out/test/cons-aura.log && grep -q "committed" out/test/cons-aura/explain.md && grep -q "rolled-back" out/test/cons-aura/explain.md \
    && awk -F'\t' '$3==2' out/test/cons-aura/cons-summary.tsv | grep -q K; then echo "ok   aura-consolidate"; else echo "FAIL aura-consolidate"; fail=1; fi
+# 12) 合成货位分配（B 部分）：成本模型 / 硬约束 / EoH-S / select:offline / 协议不变量
+if python3 tests/test_slotting.py > out/test/slotting.log 2>&1; then echo "ok   slotting-tests"; else cat out/test/slotting.log; echo "FAIL slotting-tests"; fail=1; fi
+python3 slotting/run_slotting.py --seed 3 --windows 8 --budget 200 --plan-samples 150 --clair-iters 200 --out out/test/slotting-run.json --quiet
+python3 - <<'PY' && echo "ok   slotting-run" || { echo "FAIL slotting-run"; fail=1; }
+import json
+r = json.load(open("out/test/slotting-run.json"))
+assert len(r["series"]["portfolio"]) == 8 and r["members"]
+assert r["oracle"]["worst"] <= r["sbs_roll"]["worst"] + 1e-9
+assert r["clairvoyant"]["worst"] <= r["oracle"]["worst"] + 1e-9
+assert r["gain"]["selection_headroom"] < 0.05      # 报告的不可达证据是一个回归测试
+assert r["drift"]["first_drift_week"] is not None or r["windows"] < 28
+PY
 exit $fail
