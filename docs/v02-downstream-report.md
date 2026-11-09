@@ -1,7 +1,7 @@
 # v0.2 下游验证报告：aura-loading-prototype（P9，仅合成数据）
 
 > 仓库：cybrid-systems/aura-loading-prototype，基线提交 `240551e`（main）。
-> Aura 固定到 **v0.2.0**（tag `cf7353373`；`std/portfolio`、`std/algo-select`、`std/hyper-heuristic`、`std/moead`、`std/pareto`、`std/evo-core` 均在该版本）。B1/B3 与 MOO 已于 2026-11-09 在 `v0.2.0` 上复测（§4.4 / §4.7 / §A5），B1/B3 逐 seed 数字与 `v0.2.0-rc 99ddc81c9` 一致；其余 A 组数字仍在 rc 提交上采集。
+> Aura 固定到 **v0.2.0**（tag `cf7353373`；`std/portfolio`、`std/algo-select`、`std/hyper-heuristic`、`std/moead`、`std/pareto`、`std/evo-core` 均在该版本）。B1/B3、A4（EoH 门禁）与 MOO 已于 2026-11-09 在 `v0.2.0` 上复测（§4.4 / §4.7 / §A4 / §A5），B1/B3 逐 seed 数字与 `v0.2.0-rc 99ddc81c9` 一致；其余 A 组数字仍在 rc 提交上采集。
 > 本报告所有数字都来自 `tools/gen_synthetic.py` / `tools/gen_pool.py` / `slotting/gen_slotting.py` 生成的**合成**数据；没有读取、推导或提交任何真实柜单。
 
 ## 0. 结论摘要
@@ -11,7 +11,7 @@
 | A1 实际算力偏离预算 ≤10% | **部分通过** | 装载矩阵 8 个 Agent 共 960 次运行，中位偏离 −2.4%～−3.1%，100% 在 ±10% 内；逐级淘汰的 1142 ms 时间片只有 64%–82% 在 ±10% 内（中位 −5%～−8%）；拼柜层超出预算 2–7 倍（见 5.2，PARTIAL） |
 | A2 按特征选择 + 淘汰 优于固定 4 Agent（p<0.05） | **未通过（在噪声内）** | 留出集总运费 164.5 vs 164.7（+0.12%），配对 t=0.19，p=0.43 |
 | A3 SBS→VBS 间隙闭合 ≥40% | **通过（但间隙本身很小）** | 81.8%（按 seed 平均 95%）；SBS 33.35，VBS 32.80，方法 32.90，间隙仅占运费的 1.6% |
-| A4 训练升/留出降的 KEEP = 0（5 seed） | **通过** | 5 seed × 7 候选：1 个 KEEP（same-up，seed 1），其留出集也改善（+0.35）；0 个坏 KEEP |
+| A4 训练升/留出降的 KEEP = 0（5 seed） | **通过** | v0.2.0 复测 5 seed × 7 候选：2 个 KEEP（seed 3 的 big-up / same-up，holdout +1.7 / 0.0），0 个坏 KEEP；rc 上为 1 个 |
 | A5 放松安全底线 100% ROLLBACK | **通过** | 3 个放松候选（squeeze/anyrot/lifo=0）× 5 seed = 15/15 ROLLBACK-safety，审计完整 |
 | A6 多目标 Pareto + verify.py 可行 | **通过** | 成员级前沿 4 个；MOEA/D+NSGA-II 234 个点（v0.2.0 复测）；抽检 40 个成员方案 + 全部 MOO 方案通过 `tools/verify.py`，0 不可行 |
 | B1 组合+在线 最差族比 SBS 低 ≥5%（配对中位数 + bootstrap CI） | **通过** | 5 seed 最差族 +15.0%/+32.5%/+28.4%/+29.9%/+28.4%（均值 +26.8%），5/5 CI 下界 > 0；混合流中位 +31.7%…+34.9%（见 4.4） |
