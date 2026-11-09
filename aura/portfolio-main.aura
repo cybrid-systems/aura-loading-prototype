@@ -1,0 +1,233 @@
+;; aura/portfolio-main.aura — v0.2 P9 downstream driver (synthetic only)
+;;
+;; PC_MODE=matrix|select-halving|eoh|moo-front
+;; matrix        : performance matrix for one seed (shard) -> matrix JSON
+;; select-halving: fit select:offline on the merged train matrix, then for every
+;;                 holdout instance run alloc successive-halving over the chosen four
+;;                 members with the same total budget as the fixed four (4 x B)
+;; eoh           : EoH-style proposals in an isolated worldline, paired gate, audit
+;; moo-front     : MOEA/D and NSGA-II fronts over (cost, cog-dev, door-load)
+(require "std/portfolio" all:)
+(require "std/algo-select" all:)
+(require "std/hyper-heuristic" all:)
+(require "std/moead" all:)
+(require "std/pareto" all:)
+(require "std/json" all:)
+(require "std/process" all:)
+(require "std/list" all:)
+(require "std/string" all:)
+
+(define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
+(define (num s d) (let ((v (try (string->number s) (catch (e) #f)))) (if (number? v) v d)))
+(define (jget h k d) (if (and (hash? h) (hash-has-key? h k)) (hash-ref h k) d))
+(define (split-ws s)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (start 0) (acc (list)))
+      (cond ((= i n) (reverse (if (> i start) (cons (substring s start i) acc) acc)))
+            ((char=? (string-ref s i) #\space) (loop (+ i 1) (+ i 1) (if (> i start) (cons (substring s start i) acc) acc)))
+            (else (loop (+ i 1) start acc))))))
+(define (index-of x xs)
+  (let loop ((ys xs) (i 0)) (cond ((null? ys) -1) ((equal? (car ys) x) i) (else (loop (cdr ys) (+ i 1))))))
+(define (min-of xs) (if (null? xs) #f (foldl (lambda (a b) (if (< b a) b a)) (car xs) (cdr xs))))
+
+(define mode (env-or "PC_MODE" "matrix"))
+(define budget (num (env-or "PC_BUDGET_MS" "700") 700))
+(define seed (num (env-or "PC_SEED" "1") 1))
+(define out-dir (env-or "PC_OUT" "out/portfolio"))
+(define insts (split-ws (env-or "PC_INSTANCES" "")))
+(define family (env-or "PC_FAMILY" "packing"))
+(define pf (portfolio:build budget family))
+
+;; ── feature cache (one subprocess per instance per process) ────────────
+(define feat-cache (hash))
+(define (features-of inst)
+  (let ((k (format "~a" inst)))
+    (if (hash-has-key? feat-cache k)
+        (hash-ref feat-cache k)
+        (let ((f (pc-features inst)))
+          (hash-set! feat-cache k f)
+          f))))
+(define (features-fn inst)
+  ;; 7 numeric features: with more than |members| keys the pinned std/algo-select
+  ;; (99ddc81c9) indexes a score row with a feature index in select-tree-total
+  ;; (algo-select.aura:225) and aborts even when model = knn.  Seven keeps the
+  ;; tree fit well-formed and still covers the dispatch features.
+  (let ((f (features-of inst)))
+    (hash "types" (jget f "types" 0)
+          "fill" (jget f "fill" 0)
+          "oversize" (jget f "oversize" 0)
+          "stops" (jget f "stops" 1)
+          "density" (jget f "density" 0)
+          "weight_fill" (jget f "weight_fill" 0)
+          "fragile" (jget f "fragile" 0))))
+
+;; ── matrix (one seed per shard) ────────────────────────────────────────
+(define (run-matrix)
+  (let ((m (portfolio:matrix pf insts (hash "seeds" (list seed)))))
+    (write-file (format "~a/matrix_s~a.json" out-dir seed)
+                (json-encode (hash "members" (hash-ref m "members")
+                                   "instances" (hash-ref m "instances")
+                                   "seeds" (hash-ref m "seeds")
+                                   "means" (hash-ref m "means")
+                                   "vars" (hash-ref m "vars"))))
+    (display (format "@@matrix seed=~a instances=~a members=~a~%" seed
+                     (length insts) (length (hash-ref m "members"))))))
+
+;; ── select:offline + successive halving on the holdout ─────────────────
+(define (portfolio-of names)
+  (let ((p (portfolio:make (hash "sense" "min"))))
+    (for-each (lambda (n)
+                (set! p (portfolio:add! p n
+                          (if (member? n moo-members) (moo-factory n budget)
+                              (member-factory n budget)))))
+              names)
+    p))
+
+(define (run-select-halving)
+  (let* ((train (json-parse (read-file (env-or "PC_TRAIN_MATRIX"
+                                               (format "~a/matrix_merged.json" out-dir)))))
+         (s0 (select:make (hash "model" "knn" "k" 2 "sense" "min")))
+         (s1 (select:features-fn! s0 features-fn))
+         (s2 (select:offline s1 train (hash)))
+         (rep (select:report s2))
+         (runs (list))
+         (rows (list)))
+    (write-file (format "~a/select-report_s~a.json" out-dir seed) (json-encode rep))
+    (for-each
+      (lambda (inst)
+        (let* ((chosen (take (select:choose s2 inst 4) 4))
+               (p (portfolio-of chosen))
+               (r (portfolio:run p inst (hash "budget-ms" (* 4 budget)
+                                              "alloc" "successive-halving")))
+               (rowlist (hash-ref r "rows" (list))))
+          (set! runs (cons (format "~a\t~a\t~a\t~a\t~a\t~a"
+                                   seed inst (string-join chosen "+") (hash-ref r "winner" "-")
+                                   (hash-ref r "winner-score" -1) (hash-ref r "spent-ms" 0))
+                           runs))
+          (for-each (lambda (row)
+                      (set! rows (cons (format "~a\t~a\t~a\t~a\t~a\t~a\t~a\t~a"
+                                               seed (pc-basename inst) (hash-ref row "member" "-")
+                                               (hash-ref row "budget-ms" 0) (hash-ref row "actual-ms" 0)
+                                               (hash-ref row "status" "-") (hash-ref row "score" -1)
+                                               (hash-ref r "winner" "-"))
+                                       rows)))
+                    rowlist)))
+      insts)
+    (write-file (format "~a/halving_s~a.tsv" out-dir seed) (string-append (string-join (reverse runs) "\n") "\n"))
+    (write-file (format "~a/halving-audit_s~a.tsv" out-dir seed) (string-append (string-join (reverse rows) "\n") "\n"))
+    (display (format "@@select seed=~a gap=~a~%" seed (jget rep "gap-closure" -1)))))
+
+;; ── EoH proposals in a worldline, paired gate, audit ───────────────────
+(define (safety-violation params)
+  ;; the hard-constraint line: squeeze (soft-carton compression), anyrot (tipping),
+  ;; lifo=0.  None may ever be committed (the repo's evolve gate is stricter, this
+  ;; downstream study keeps the same red line).
+  (cond ((string-contains? params "squeeze=0.0" ) #f)
+        ((string-contains? params "squeeze=" ) (not (string-contains? params "squeeze=0 ")))
+        ((string-contains? params "anyrot=1") "anyrot")
+        ((string-contains? params "lifo=0") "lifo")
+        (else #f)))
+
+(define (cand-score inst params seed)
+  (let ((j (pc-run inst "param" budget seed params)))
+    (jget j "cost" 1e9)))
+
+(define (run-eoh)
+  (let* ((train (split-ws (env-or "PC_TRAIN" "")))
+         (hold (split-ws (env-or "PC_HOLDOUT" "")))
+         (base "space=0 w_vol=0.3 w_big=1.0 w_same=0.5 w_heavy=0.3")
+         (cands (list (list "big-up" "space=0 w_vol=0.3 w_big=1.4 w_same=0.5 w_heavy=0.3" #f)
+                      (list "same-up" "space=0 w_vol=0.3 w_big=1.0 w_same=0.9 w_heavy=0.3" #f)
+                      (list "fit-gap" "space=0 w_vol=0.3 w_big=1.0 w_same=0.5 w_heavy=0.3 w_waste=1.0" #f)
+                      (list "heavy-up" "space=0 w_vol=0.3 w_big=1.0 w_same=0.5 w_heavy=0.9" #f)
+                      (list "squeeze" "space=0 squeeze=0.02" "squeeze")
+                      (list "anyrot" "space=0 anyrot=1" "anyrot")
+                      (list "lifo-off" "space=0 lifo=0" "lifo")))
+         (audit (list (format "phase\tseed\tname\tstatus\tp\tmean_diff\ttrain_delta\thold_delta")))
+         (keeps 0) (rollbacks 0))
+    (for-each
+      (lambda (c)
+        (let* ((name (car c)) (params (cadr c)) (viol (caddr c)))
+          (if (or viol (safety-violation params))
+              (begin
+                (set! rollbacks (+ rollbacks 1))
+                (set! audit (cons (format "eoh\t~a\t~a\tROLLBACK-safety\t-\t-\t-\t-" seed name) audit)))
+              (let* ((tr (map (lambda (i) (cand-score i params seed)) train))
+                     (bl (map (lambda (i) (cand-score i base seed)) train))
+                     (g (tune:gate tr bl (hash "alpha" 0.05 "sense" "min")))
+                     (keep? (jget g "keep" #f))
+                     (hd (if keep? (let ((cr (map (lambda (i) (cand-score i params seed)) hold))
+                                           (br (map (lambda (i) (cand-score i base seed)) hold)))
+                                     (- (foldl + 0 br) (foldl + 0 cr))) 0)))
+                (if keep?
+                    (begin
+                      (set! keeps (+ keeps 1))
+                      (set! audit (cons (format "eoh\t~a\t~a\tKEEP\t~a\t~a\t~a\t~a" seed name
+                                                (jget g "t" 0) (jget g "mean-diff" 0)
+                                                (- (foldl + 0 bl) (foldl + 0 tr)) hd) audit)))
+                    (begin
+                      (set! rollbacks (+ rollbacks 1))
+                      (set! audit (cons (format "eoh\t~a\t~a\tROLLBACK-gate\t~a\t~a\t~a\t-"
+                                                seed name (jget g "t" 0) (jget g "mean-diff" 0)
+                                                (- (foldl + 0 bl) (foldl + 0 tr))) audit))))))))
+      cands)
+    (write-file (format "~a/eoh_s~a.tsv" out-dir seed) (string-append (string-join (reverse audit) "\n") "\n"))
+    (display (format "@@eoh seed=~a keeps=~a rollbacks=~a~%" seed keeps rollbacks))))
+
+;; ── MOO fronts (真实前沿，不只是最优解) ──────────────────────────────
+(define (moo-point-key objs)
+  (format "~a|~a|~a" (list-ref objs 0) (list-ref objs 1) (list-ref objs 2)))
+
+(define (run-moo-front)
+  (let* ((mb (num (env-or "PC_MOO_BUDGET_MS" "3000") 3000))
+         (out (list (format "instance\talgo\tcost\tcog_dev\tdoor_load\tplan")))
+         (evals (max 14 (min 28 (quotient mb 200)))))
+    (for-each
+      (lambda (inst)
+        (for-each
+          (lambda (algo)
+            (let* ((deadline (+ (monotonic-ms) (max 300 (- mb 200))))
+                   (plans (hash))
+                   (evalf (lambda (cand)
+                            (let* ((g (hash-ref cand "genome" (list 0.5 0.5 0.5 0.5)))
+                                   (left (- deadline (monotonic-ms))))
+                              (if (< left 90)
+                                  (list 1e7 10.0 1.0)
+                                  (let* ((j (pc-run inst "param" (min left 300) seed (genome->params g)))
+                                         (objs (list (jget j "cost" 1e9)
+                                                     (jget j "cog_dev" 1.0)
+                                                     (jget j "door_load" 1.0))))
+                                    (hash-set! plans (moo-point-key objs) (jget j "plan_file" ""))
+                                    objs)))))
+                   (bounds (list (list 0.0 1.0) (list 0.0 1.0) (list 0.0 1.0) (list 0.0 1.0))))
+              (let* ((st (if (string=? algo "moead")
+                             (moead:make (hash "n-obj" 3 "H" 3 "T" 3 "dim" 4 "seed" seed "bounds" bounds))
+                             (nsga2:make (hash "dim" 4 "pop" 6 "seed" seed "bounds" bounds
+                                               "dirs" (list "min" "min" "min")))))
+                     (st2 (if (string=? algo "moead")
+                              (moead:run! st evalf evals)
+                              (nsga2:run! st evalf evals)))
+                     (front (if (string=? algo "moead") (moead:front st2) (nsga2:front st2))))
+                (for-each
+                  (lambda (e)
+                    (let* ((objs (jget e "objs" (list 1e9 1.0 1.0)))
+                           (pl (jget plans (moo-point-key objs) "")))
+                      (set! out (cons (format "~a\t~a\t~a\t~a\t~a\t~a"
+                                              (pc-basename inst) algo
+                                              (list-ref objs 0) (list-ref objs 1) (list-ref objs 2) pl)
+                                      out))))
+                  front))))
+          moo-members))
+      insts)
+    (write-file (format "~a/moo_s~a.tsv" out-dir seed)
+                (string-append (string-join (reverse out) "\n") "\n"))
+    (display (format "@@moo seed=~a rows=~a~%" seed (- (length out) 1)))))
+
+(sh (format "mkdir -p ~a" out-dir))
+(cond ((string=? mode "matrix") (run-matrix))
+      ((string=? mode "select-halving") (run-select-halving))
+      ((string=? mode "eoh") (run-eoh))
+      ((string=? mode "moo-front") (run-moo-front))
+      (else (display (format "unknown mode ~a~%" mode))))
+(display "@@done=ok")
+(newline)

@@ -1,0 +1,74 @@
+[
+ {
+  "order": "order_01",
+  "file": "order_01.txt",
+  "lines": 23,
+  "boxes": 734
+ },
+ {
+  "order": "order_02",
+  "file": "order_02.txt",
+  "lines": 7,
+  "boxes": 134
+ },
+ {
+  "order": "order_03",
+  "file": "order_03.txt",
+  "lines": 13,
+  "boxes": 350
+ },
+ {
+  "order": "order_04",
+  "file": "order_04.txt",
+  "lines": 31,
+  "boxes": 767
+ },
+ {
+  "order": "order_05",
+  "file": "order_05.txt",
+  "lines": 43,
+  "boxes": 1113
+ },
+ {
+  "order": "order_06",
+  "file": "order_06.txt",
+  "lines": 24,
+  "boxes": 520
+ },
+ {
+  "order": "order_07",
+  "file": "order_07.txt",
+  "lines": 32,
+  "boxes": 978
+ },
+ {
+  "order": "order_08",
+  "file": "order_08.txt",
+  "lines": 11,
+  "boxes": 288
+ },
+ {
+  "order": "order_09",
+  "file": "order_09.txt",
+  "lines": 5,
+  "boxes": 175
+ },
+ {
+  "order": "order_10",
+  "file": "order_10.txt",
+  "lines": 7,
+  "boxes": 194
+ },
+ {
+  "order": "order_11",
+  "file": "order_11.txt",
+  "lines": 6,
+  "boxes": 126
+ },
+ {
+  "order": "order_12",
+  "file": "order_12.txt",
+  "lines": 15,
+  "boxes": 423
+ }
+]

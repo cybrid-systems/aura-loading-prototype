@@ -1,0 +1,38 @@
+{
+ "R1": [
+  "examples/pool-v02/route_1.txt"
+ ],
+ "R2": [
+  "examples/pool-v02/route_2.txt"
+ ],
+ "R3": [
+  "examples/pool-v02/route_3.txt"
+ ],
+ "R4": [
+  "examples/pool-v02/route_4.txt"
+ ],
+ "R5": [
+  "examples/pool-v02/route_5.txt"
+ ],
+ "R6": [
+  "examples/pool-v02/route_6.txt"
+ ],
+ "R7": [
+  "examples/pool-v02/route_7.txt"
+ ],
+ "R8": [
+  "examples/pool-v02/route_8.txt"
+ ],
+ "R9": [
+  "examples/pool-v02/route_9.txt"
+ ],
+ "R10": [
+  "examples/pool-v02/route_10.txt"
+ ],
+ "R11": [
+  "examples/pool-v02/route_11.txt"
+ ],
+ "R12": [
+  "examples/pool-v02/route_12.txt"
+ ]
+}

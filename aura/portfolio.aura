@@ -1,0 +1,180 @@
+;; aura/portfolio.aura — v0.2 P9 downstream portfolio (synthetic data only)
+;;
+;; Registers the packing constructors (8), the consolidation members (nf/ff/ffd/lns)
+;; and the two multi-objective search members (MOEA/D, NSGA-II) behind std/portfolio.
+;; Every member is a factory (lambda (instance ctx) score-or-hash); the score is the
+;; relative freight cost (sense = min), lower is better.  Actual compute is audited:
+;; pc_eval.py stops inside the budget it is given and records wall-ms per run.
+;;
+;;   (require "std/portfolio" all:)
+;;   (define pf (portfolio:build 700 "packing"))
+;;   (portfolio:matrix pf instances (hash "seeds" (list 1 2 3 4 5)))
+;;
+;; MOEA/D and NSGA-II come from std/moead and std/pareto; their genome is decoded to
+;; kernel weights (space rule + four weights) and each candidate is evaluated by the
+;; same C++ kernel as the constructors.
+
+(require "std/portfolio" all:)
+(require "std/algo-select" all:)
+(require "std/hyper-heuristic" all:)
+(require "std/moead" all:)
+(require "std/pareto" all:)
+(require "std/json" all:)
+(require "std/process" all:)
+(require "std/list" all:)
+(require "std/string" all:)
+
+(export portfolio:build pc-run pc-features member-names packing-members
+        consolidation-members moo-members pc-work pc-basename pc-audit!)
+
+(define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
+(define (jget h k d) (if (and (hash? h) (hash-has-key? h k)) (hash-ref h k) d))
+(define (pc-work) (env-or "PC_WORK" "out/portfolio/work"))
+
+(define (pc-basename path)
+  (let* ((ls (map (lambda (c) (if (char=? c #\/) #\space c)) (string->list path)))
+         (parts (string-split (list->string ls) " "))
+         (clean (filter (lambda (s) (> (string-length s) 0)) parts)))
+    (if (null? clean) path (list-ref clean (- (length clean) 1)))))
+
+(define *ctor-params*
+  (hash "wall" "space=0 w_vol=1.0 w_yz=0.5"
+        "layer" "space=1 w_vol=0.5 w_xy=1.0"
+        "block" "space=2 w_vol=1.0"
+        "human" "space=0 w_vol=0.3 w_big=1.0 w_same=0.5 w_heavy=0.3"
+        "oversize" "space=2 w_vol=0.5 w_big=2.0 w_heavy=0.5"
+        "cog" "space=1 w_vol=0.5 w_xy=0.5 w_heavy=1.5"
+        "mixed" "space=0 w_vol=1.0 w_yz=0.5 mixed=1"
+        "fitgap" "space=0 w_vol=1.0 w_waste=1.0"))
+
+(define packing-members
+  (list "wall" "layer" "block" "human" "oversize" "cog" "mixed" "fitgap"))
+(define consolidation-members (list "nf" "ff" "ffd" "lns"))
+(define moo-members (list "moead" "nsga2"))
+(define member-names (append packing-members consolidation-members moo-members))
+
+(define (pc-audit! line)
+  (let ((p (env-or "PC_AUDIT" #f)))
+    (if p (let ((old (try (read-file p) (catch (e) ""))))
+            (write-file p (string-append (if (string? old) old "") line "\n")))
+        #f)))
+
+;; ── one member run: pc_eval.py prints its record as the first stdout line ──
+(define (pc-run inst member budget seed params)
+  (let* ((out (format "~a/~a_~a_s~a.json" (pc-work) member (pc-basename inst) seed))
+         (cmd (format "python3 tools/pc_eval.py --problem ~a --member ~a --budget-ms ~a --seed ~a --out ~a~a"
+                      inst member budget seed out
+                      (if (and (string? params) (> (string-length params) 0))
+                          (format " --params ~a" params) "")))
+         (txt (command-output cmd))
+         (line (car (string-split txt "\n")))
+         (j (try (json-parse line) (catch (e) #f))))
+    (if (hash? j) j
+        (hash "score" 1e9 "cost" 1e9 "cog_dev" 1.0 "door_load" 1.0
+              "feasible" #f "wall_ms" 0 "plan_file" out))))
+
+(define (ctx-seed ctx)
+  (if (hash-has-key? ctx "seed") (hash-ref ctx "seed" 1)
+      (let ((v (try (string->number (env-or "PC_SEED" "1")) (catch (e) 1))))
+        (if (number? v) v 1))))
+
+(define (pc-features inst)
+  (let* ((cmd (format "python3 tools/pc_eval.py --features --problem ~a" inst))
+         (txt (command-output cmd))
+         (j (try (json-parse (car (string-split txt "\n"))) (catch (e) #f))))
+    (if (hash? j) j (hash "types" 0 "fill" 0 "oversize" 0 "stops" 1
+                          "density" 0 "weight_fill" 0 "fragile" 0
+                          "boxes" 0 "vol" 0 "hazmat" 0))))
+
+;; ── constructor / consolidation factory ────────────────────────────────
+(define (member-factory name budget)
+  (lambda (inst ctx)
+    (let* ((b0 (hash-ref ctx "budget-ms" 0))
+           (b (if (> b0 0) b0 budget))
+           (sd (ctx-seed ctx))
+           (j (pc-run inst name b sd "")))
+      (hash "score" (jget j "score" 1e9)
+            "cost" (jget j "cost" 1e9)
+            "cog_dev" (jget j "cog_dev" 1.0)
+            "door_load" (jget j "door_load" 1.0)
+            "feasible" (jget j "feasible" #f)
+            "wall_ms" (jget j "wall_ms" 0)
+            "budget_ms" b
+            "plan_file" (jget j "plan_file" "")))))
+
+;; ── MOEA/D / NSGA-II factory: genome -> kernel weights ─────────────────
+(define (genome->params g)
+  (let* ((x0 (if (list? g) (list-ref g 0) 0.5))
+         (x1 (if (list? g) (list-ref g 1) 0.5))
+         (x2 (if (list? g) (list-ref g 2) 0.5))
+         (x3 (if (list? g) (list-ref g 3) 0.5))
+         (space (cond ((< x0 0.34) 0) ((< x0 0.67) 1) (else 2)))
+         (vol (+ 0.2 (* 1.8 x1)))
+         (yz (* 2.0 x2))
+         (big (* 2.0 x3)))
+    (format "space=~a w_vol=~a w_yz=~a w_big=~a" space vol yz big)))
+
+(define (moo-factory algo budget)
+  (lambda (inst ctx)
+    (let* ((b0 (hash-ref ctx "budget-ms" 0))
+           (b (if (> b0 0) b0 budget))
+           (sd (ctx-seed ctx))
+           (deadline (+ (monotonic-ms) (max 120 (- b 110))))
+           (cache (hash))
+           (evalf (lambda (cand)
+                    (let* ((g (hash-ref cand "genome" (list 0.5 0.5 0.5 0.5)))
+                           (left (- deadline (monotonic-ms))))
+                      (if (< left 70)
+                          (list 1e7 10.0 1.0)
+                          (let* ((j (pc-run inst "param" (min left 240) sd (genome->params g))))
+                            (hash-set! cache (jget j "plan_file" "")
+                                       (hash "score" (jget j "score" 1e9)
+                                             "cost" (jget j "cost" 1e9)
+                                             "cog_dev" (jget j "cog_dev" 1.0)
+                                             "door_load" (jget j "door_load" 1.0)
+                                             "feasible" (jget j "feasible" #f)
+                                             "wall_ms" (jget j "wall_ms" 0)
+                                             "budget_ms" (min left 240)
+                                             "plan_file" (jget j "plan_file" "")))
+                            (list (jget j "cost" 1e9)
+                                  (jget j "cog_dev" 1.0)
+                                  (jget j "door_load" 1.0)))))))
+           (bounds (list (list 0.0 1.0) (list 0.0 1.0) (list 0.0 1.0) (list 0.0 1.0)))
+           (evals (max 4 (min 14 (quotient b 120))))
+           (st (if (string=? algo "moead")
+                   (moead:make (hash "n-obj" 3 "H" 4 "T" 3 "dim" 4 "seed" sd "bounds" bounds))
+                   (nsga2:make (hash "dim" 4 "pop" 4 "seed" sd "bounds" bounds))))
+           (st2 (if (string=? algo "moead")
+                    (moead:run! st evalf evals)
+                    (nsga2:run! st evalf evals)))
+           (best (let loop ((ks (hash-keys cache)) (acc #f))
+                   (if (null? ks) acc
+                       (let ((r (hash-ref cache (car ks))))
+                         (loop (cdr ks)
+                               (if (or (not acc)
+                                       (and (jget r "feasible" #f) (not (jget acc "feasible" #f)))
+                                       (and (equal? (jget r "feasible" #f) (jget acc "feasible" #f))
+                                            (< (jget r "cost" 1e9) (jget acc "cost" 1e9))))
+                                   r acc)))))))
+      (if (not (hash? best))
+          (hash "score" 1e9 "cost" 1e9 "cog_dev" 1.0 "door_load" 1.0 "feasible" #f
+                "wall_ms" 0 "budget_ms" b "plan_file" "")
+          best))))
+
+;; ── registry ───────────────────────────────────────────────────────────
+(define (portfolio:build budget family)
+  (let* ((pf (portfolio:make (hash "sense" "min")))
+         (names (cond ((string=? family "packing") packing-members)
+                      ((string=? family "consolidation") consolidation-members)
+                      ((string=? family "moo") moo-members)
+                      (else member-names))))
+    (for-each
+      (lambda (n)
+        (let ((f (cond ((member? n moo-members) (moo-factory n budget))
+                       (else (member-factory n budget)))))
+          (set! pf (portfolio:add! pf n f (hash "family" (if (member? n packing-members) "packing"
+                                                             (if (member? n consolidation-members)
+                                                                 "consolidation" "moo"))
+                                                "budget-ms" budget)))))
+      names)
+    pf))

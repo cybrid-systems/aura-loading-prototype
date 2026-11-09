@@ -10,3 +10,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: kernel + verify (synthetic only)
         run: tests/run_tests.sh || true   # Aura 部分需要镜像中有 aura 可执行文件（AURA_BIN）
+      - name: v0.2 downstream smoke (synthetic only)
+        run: tools/v02_smoke.sh
