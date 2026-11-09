@@ -1,7 +1,7 @@
 # v0.2 下游验证报告：aura-loading-prototype（P9，仅合成数据）
 
 > 仓库：cybrid-systems/aura-loading-prototype，基线提交 `240551e`（main）。
-> Aura 固定到 **99ddc81c9**（v0.2.0-rc 线，`std/portfolio`、`std/algo-select`、`std/hyper-heuristic`、`std/moead`、`std/pareto`、`std/evo-core` 均已在该提交）。
+> Aura 固定到 **v0.2.0**（tag `cf7353373`；`std/portfolio`、`std/algo-select`、`std/hyper-heuristic`、`std/moead`、`std/pareto`、`std/evo-core` 均在该版本）。B1/B3 与 MOO 已于 2026-11-09 在 `v0.2.0` 上复测（§4.4 / §4.7 / §A5），B1/B3 逐 seed 数字与 `v0.2.0-rc 99ddc81c9` 一致；其余 A 组数字仍在 rc 提交上采集。
 > 本报告所有数字都来自 `tools/gen_synthetic.py` / `tools/gen_pool.py` / `slotting/gen_slotting.py` 生成的**合成**数据；没有读取、推导或提交任何真实柜单。
 
 ## 0. 结论摘要
@@ -13,7 +13,7 @@
 | A3 SBS→VBS 间隙闭合 ≥40% | **通过（但间隙本身很小）** | 81.8%（按 seed 平均 95%）；SBS 33.35，VBS 32.80，方法 32.90，间隙仅占运费的 1.6% |
 | A4 训练升/留出降的 KEEP = 0（5 seed） | **通过** | 5 seed × 7 候选：1 个 KEEP（same-up，seed 1），其留出集也改善（+0.35）；0 个坏 KEEP |
 | A5 放松安全底线 100% ROLLBACK | **通过** | 3 个放松候选（squeeze/anyrot/lifo=0）× 5 seed = 15/15 ROLLBACK-safety，审计完整 |
-| A6 多目标 Pareto + verify.py 可行 | **通过** | 成员级前沿 4 个；MOEA/D+NSGA-II 232 个点；抽检 40 个成员方案 + 232 个 MOO 方案全部通过 `tools/verify.py`，0 不可行 |
+| A6 多目标 Pareto + verify.py 可行 | **通过** | 成员级前沿 4 个；MOEA/D+NSGA-II 234 个点（v0.2.0 复测）；抽检 40 个成员方案 + 全部 MOO 方案通过 `tools/verify.py`，0 不可行 |
 | B1 组合+在线 最差族比 SBS 低 ≥5%（配对中位数 + bootstrap CI） | **通过** | 5 seed 最差族 +15.0%/+32.5%/+28.4%/+29.9%/+28.4%（均值 +26.8%），5/5 CI 下界 > 0；混合流中位 +31.7%…+34.9%（见 4.4） |
 | B2 漂移后 ≤2 窗口切换 | **通过** | 预测在窗口开始就暴露需求旋转（检测 0 窗口）；注入季节漂移后需要换代时 1–2 窗口内完成（seed 7/19），其余 seed 的最优成员没变所以不换（`drift.pick_change_lag`） |
 | B3 前沿中存在距离不劣于 SBS 且通道方差 −10% | **通过** | 前端已换成 Aura `std/moead` ask/tell，MOEA/D 配置进入组合（并在 4/5 seed 上是全年 SBS）；峰值周角点 **5/5** 命中，距离比 0.930–0.993，方差比 0.823–0.898（见 4.7） |
@@ -119,8 +119,8 @@
 | mixed | 2.7983 | 0.1319 | 0.4943 |
 | fitgap | 2.8025 | 0.1668 | 0.4906 |
 
-- MOEA/D 与 NSGA-II（`std/moead` / `std/pareto`，3 目标，8 s/实例，4 个留出单 × 5 seed）：**232 个前沿点**。
-- 可行性：抽检成员方案 40 个（每个成员 5 个）+ MOO 全部 232 个方案，`tools/verify.py` **0 失败**。
+- MOEA/D 与 NSGA-II（`std/moead` / `std/pareto`，3 目标，8 s/实例，4 个留出单 × 5 seed）：**234 个前沿点**（2026-11-09 在 `v0.2.0` 上复测；rc 上为 232）。
+- 可行性：抽检成员方案 40 个（每个成员 5 个）+ MOO 全部 234 个方案，`tools/verify.py` **0 失败**。
 
 ## 4. B. 合成货位分配（`slotting/`）——第 3 轮：互补订单族 + 每族配对中位数
 
@@ -236,7 +236,7 @@ EoH-S 在训练 seed 上进化，3 个候选全部 KEEP，leave-one-out 边际 *
 
 ### 5.3 CI 与 pin
 - `ci/test.yml` 增加 `tools/v02_smoke.sh`（合成数据、小预算：6 个成员各 300 ms + 8 窗口 slotting）。
-- Aura pin：`99ddc81c9`；运行时要求 `AURA_PATH=<aura>/lib`（`tools/portfolio_v02.sh` 会检查）。
+- Aura pin：`v0.2.0`（`cf7353373`）；运行时要求 `AURA_PATH=<aura>/lib`（`tools/portfolio_v02.sh` 会检查）。A 组其余数字采集自 rc `99ddc81c9`。
 - CI 只跑合成数据；`out/` 不入库。
 
 ## 6. 限制
@@ -251,8 +251,8 @@ EoH-S 在训练 seed 上进化，3 个候选全部 KEEP，leave-one-out 边际 *
 ## 7. 复现
 
 ```bash
-export AURA_PATH=/path/to/aura-99ddc81c9/lib   # aura checkout at 99ddc81c9
-export AURA_BIN=/path/to/aura-99ddc81c9/build/aura   # 供 slotting 的 B3 前端发现 aura
+export AURA_PATH=/path/to/aura-v0.2.0/lib   # aura checkout at v0.2.0
+export AURA_BIN=/path/to/aura-v0.2.0/build/aura   # 供 slotting 的 B3 前端发现 aura
 python3 build.py
 tools/portfolio_v02.sh all                     # 约 20–30 分钟，14 核
 python3 slotting/gen_slotting.py --seed 7 --out slotting/data/s7.json
