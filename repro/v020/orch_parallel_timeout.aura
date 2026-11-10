@@ -1,0 +1,13 @@
+;; Minimal repro: orch:parallel's timeout argument does not bound the join.
+;; std/orch.aura joins every worker before the timeout fiber, and fiber:join
+;; blocks, so a body that only yields never observes the timeout.
+(require "std/orch" all:)
+(define (hang x)
+  (let loop ((i 0))
+    (fiber:yield)
+    (loop (+ i 1))))
+(define t0 (monotonic-ms))
+(define r (orch:parallel (list hang) 0 1))
+(display (format "@@elapsed_ms=~a" (- (monotonic-ms) t0))) (newline)
+(display (format "@@result=~a" r)) (newline)
+(display "@@status=returned") (newline)

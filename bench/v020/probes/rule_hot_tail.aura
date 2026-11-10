@@ -1,0 +1,26 @@
+;; Appended after aura/rules.aura. Times check-plan / rules->kernel-args.
+(define (say k v) (display (format "@@~a=~a" k v)) (newline))
+(define plan (hash
+  "metrics" (hash "unplaced" 0 "vol_util" 0.82 "cost" 2.6 "containers" 2)
+  "containers" (list
+    (hash "type" "40HQ" "cog" (list 0.51 0.49 0.2)
+          "end_load_kg" (hash "front" 4200 "door" 3800)))))
+(define reps 4000)
+(define t0 (monotonic-ms))
+(define bad 0)
+(let loop ((i 0))
+  (if (< i reps)
+      (begin
+        (if (not (null? (check-plan default-rules plan))) (set! bad (+ bad 1)))
+        (loop (+ i 1)))
+      #t))
+(define t1 (monotonic-ms))
+(let loop ((i 0))
+  (if (< i reps) (begin (rules->kernel-args default-rules) (loop (+ i 1))) #t))
+(define t2 (monotonic-ms))
+(say "check-bad" bad)
+(say "check-ms" (- t1 t0))
+(say "check-reps" reps)
+(say "kernel-args-ms" (- t2 t1))
+(say "kernel-args" (rules->kernel-args default-rules))
+(say "status" "ok")
