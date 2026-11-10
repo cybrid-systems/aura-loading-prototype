@@ -11,6 +11,28 @@
   (let ((f (getenv "PC_RULES")))
     (if (and (string? f) (> (string-length f) 0)) (read-from-string (read-file f)) default-rules)))
 
+(define (show-decision order h)
+  (let ((win (hget h "winner" #f)))
+    (display (format "订单 ~a" order)) (newline)
+    (display (format "胜者 ~a（提交；其余 rollback）" (if win win "无"))) (newline)
+    (for-each
+      (lambda (s)
+        (let ((name (car (car s))) (m (hget (cadr (car s)) "metrics" #f)))
+          (display (format "  ~a  柜 ~a（~a）  运费 ~a  评分 ~a  ~a"
+                           name (hget m "containers" "?") (hget m "mix" "?")
+                           (r3 (hget m "cost" 0)) (r3 (cadr s))
+                           (if (equal? name win) "提交" "回滚")))
+          (newline)))
+      (hget h "scored" (list)))
+    (for-each
+      (lambda (rj)
+        (display (format "  ~a  否决  ~a" (car rj) (join-strings (cadr rj) "；")))
+        (newline))
+      (hget h "rejected" (list)))
+    (display (format "解释 ~a/explain.md" out-dir)) (newline)
+    (display "败者已 rollback，没有写进全局方案。") (newline)
+    (newline)))
+
 (define (explain order h)
   (let ((lines (list)))
     (define (out! s) (set! lines (cons s lines)))
@@ -40,6 +62,7 @@
            (h (decide path (string-append out-dir "/" base) *rules*))
            (ms (- (monotonic-ms) t0)))
       (set! report (append report (explain base h) (list "")))
+      (show-decision base h)
       (set! summary (cons (format "~a\t~a\t~a\t~a" base (hget h "winner" "-") (hget h "plan-file" "-") ms) summary))))
   (split-ws (getenv "PC_ORDERS")))
 (write-file (string-append out-dir "/explain.md") (join-strings report "\n"))

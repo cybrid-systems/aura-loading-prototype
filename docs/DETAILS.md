@@ -26,7 +26,11 @@ tools/gen_pool.py        合成拼柜数据（多条线路，每条一批按到�
 tools/agent_matrix.py    问题 × Agent 结果矩阵：leave-one-out、按特征派发的同等算力评估
 tools/pk.py              PK 盲测：同一批问题、同一个独立校验器给各家方案打分（docs/PK.md）
 tools/viz.py             结果 JSON → 自包含 three.js 页面（旋转/缩放/按装载顺序回放）
-aura/rules.aura          规则 EDSL：hard（交给内核）/ check（方案校验否决）/ prefer（评分权重）
+aura/rules.aura          规则 EDSL：hard（交给内核）/ check（方案校验否决）/ prefer（评分权重）。禁混装、限柜型、限重也在这里
+rules/                   一份文件一个客户（customers/）或一条线（routes/）。改完 ./run.sh rules，不重编内核
+tools/ruleset.py         规则文件解析：语法和键名错误带行号；安全底线不能放松
+tools/demo_dx.py         ./run.sh rules | evolve | agents 的屏幕输出
+docs/rules.md            调度员改哪几个键
 aura/rules-fill.sexp     单柜评估用的规则文件（PC_RULES），允许剩余货物、按装载率择优
 aura/strategies.aura     构造思路 EDSL：constructor（墙式/层式/块式/人工经验）+ heuristic（人工经验规则及权重）+ knob（压缩/倒放开关）
 aura/agents.aura         每种构造思路一个 Agent fiber 并行提案，各自写 COW overlay；协调器否决+评分，胜者 commit，其余 rollback
@@ -302,6 +306,16 @@ ep 有 2 单违反危险品间距，判为不可执行；它在可执行题上�
 
 诚实的限制：运费下降 10–18% **没有**在真实数据上出现（真实柜单本来就是人工拼好的满柜，最好是持平）；派发和演化的收益目前在噪声范围内；Aura 自身还有并发和稳定性问题（见下文 issue 表）。
 
+几分钟可以自己看一遍，不用翻源码。这三条只打印当次跑出来的柜数和运费，不替代上面的 −2.9% / −3.0% / 15/15：
+
+```bash
+./run.sh rules      # 改 rules/routes/*.sexp 或 rules/customers/*.sexp，PC_RULES 热替换，内核二进制不动
+./run.sh evolve     # 屏幕打印 KEEP / ROLLBACK。关闭先卸后装、压缩、倒放必须 ROLLBACK
+./run.sh agents     # 各 Agent 柜数、运费、谁提交、谁回滚，以及 explain.md 的路径
+```
+
+改哪几个键见 [rules.md](rules.md)。
+
 ## 如何进一步发挥 Aura
 
 按预期收益从大到小：
@@ -310,7 +324,7 @@ ep 有 2 单违反危险品间距，判为不可执行；它在可执行题上�
 2. **补真实箱规**：20 份估算尺寸的柜单让所有结论只能看量级。拿到外箱尺寸后，柜内摆放和拼柜两层的结论都能变成真实数字。
 3. **把算力分配交给 Aura**：8 个 Agent 全开比 4 个好，说明瓶颈在算力。协调器可以先给每个 Agent 一小段时间，再把剩余时间分给领先的 1–2 个（逐步淘汰），而不是平均分；时间上限也要下沉到构造阶段，才能做严格的同等算力对比。
 4. **演化改成多种子评估**：每个候选跑 3–5 个种子，门禁看均值提升且超过标准差，消除赢家诅咒；把现场反馈（破损、超载、调度员否决记录）直接变成候选改动。
-5. **客户规则模板化**：每个客户/线路一份规则文件（禁混装、限柜型、限重、站序），调度员改规则当天生效，协调器自动回放历史订单验证改动不变差。
+5. **客户规则模板化**：`rules/customers/`、`rules/routes/` 已经是一份文件一个客户或一条线，`./run.sh rules` 改完即热替换，并回放合成历史单（安全底线不能放松）。下一步仍是拿到带票号、到货时间、截关时间的**未拼**数据（不入库），用拼柜层做滚动拼柜，再和人工比。这才是验证 10–18% 的方式。
 6. **PK 常态化**：每月拿一批新订单，用 `tools/pk.py` 和人工方案/商业软件盲测，排行榜只公开汇总数字。
 
 ## 与 Java / Python / Rust 实现的客观对比

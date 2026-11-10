@@ -42,6 +42,19 @@ struct Params {
 };
 
 static std::vector<CType> CT; static std::vector<Item> IT; static Params P;
+// Cargo class is the sku prefix before the first '-'. no_mix lists pairs that cannot share a container.
+// Empty means the kernel behaves exactly as before.
+static std::string sku_class(const std::string& sku) {
+  auto p = sku.find('-');
+  return p == std::string::npos ? sku : sku.substr(0, p);
+}
+static std::vector<std::pair<std::string, std::string>> NO_MIX;
+static bool classes_banned(const std::string& a, const std::string& b) {
+  if (a.empty() || b.empty() || a == b) return false;
+  for (auto& p : NO_MIX)
+    if ((p.first == a && p.second == b) || (p.first == b && p.second == a)) return true;
+  return false;
+}
 struct Sol;
 
 static bool overlap1(double a0, double a1, double b0, double b1) { return a0 < b1 - 1e-6 && b0 < a1 - 1e-6; }
@@ -62,6 +75,11 @@ static double evaluate(const Bin& b, int ii, double x, double y, double z, const
   const CType& c = CT[b.ctype]; const Item& it = IT[ii];
   if (x + d[0] > c.L + 1e-6 || y + d[1] > c.W + 1e-6 || z + d[2] > c.H + 1e-6) return INFINITY;
   if (b.kg + it.kg > c.max_kg + 1e-6) return INFINITY;
+  if (!NO_MIX.empty()) {
+    std::string cls = sku_class(it.sku);
+    for (const auto& q : b.p)
+      if (classes_banned(cls, sku_class(IT[q.item].sku))) return INFINITY;
+  }
   // merit depends only on the position, so compute it first and skip the O(n) checks when it cannot win
   double m = P.w_x * (x + d[0]) / c.L + P.w_z * (z + d[2]) / c.H + P.w_y * y / c.W;
   if (P.w_center > 0) m += P.w_center * std::fabs(y + d[1] / 2 - c.W / 2) / c.W * (it.kg / 50.0);
@@ -225,10 +243,49 @@ int main(int argc, char** argv) {
   I("cpolicy", P.cpolicy); I("iters", P.iters); D("time_ms", P.time_ms);
   if (kv.count("seed")) P.seed = (unsigned)std::atoi(kv["seed"].c_str());
   D("cog_x_lo", P.cog_x_lo); D("cog_x_hi", P.cog_x_hi); D("cog_y_lo", P.cog_y_lo); D("cog_y_hi", P.cog_y_hi);
+  if (kv.count("types")) {  // allow-list, comma separated. Unknown names are a rule error, not an empty plan.
+    std::vector<std::string> want; std::string cur;
+    for (char ch : kv["types"]) {
+      if (ch == ',') { if (!cur.empty()) want.push_back(cur); cur.clear(); }
+      else if (ch != ' ') cur.push_back(ch);
+    }
+    if (!cur.empty()) want.push_back(cur);
+    if (want.empty()) { std::fprintf(stderr, "参数 types 为空（应为 20GP,40HQ 这种柜型列表）\n"); return 2; }
+    std::vector<CType> keep;
+    for (auto& name : want) {
+      bool found = false;
+      for (auto& c : CT) if (c.name == name) { keep.push_back(c); found = true; break; }
+      if (!found) { std::fprintf(stderr, "参数 types 含未知柜型 %s\n", name.c_str()); return 2; }
+    }
+    CT.swap(keep);
+  }
   if (kv.count("only")) {  // restrict to one container type (used by the baseline)
     std::vector<CType> k; for (auto& c : CT) if (c.name == kv["only"]) k.push_back(c); CT = k;
   }
-  if (CT.empty() || IT.empty()) { std::fprintf(stderr, "empty problem\n"); return 2; }
+  if (kv.count("cap_kg")) {
+    double cap = std::atof(kv["cap_kg"].c_str());
+    if (!(cap > 0)) { std::fprintf(stderr, "参数 cap_kg 需要正数，收到 %s\n", kv["cap_kg"].c_str()); return 2; }
+    for (auto& c : CT) c.max_kg = std::min(c.max_kg, cap);
+  }
+  if (kv.count("no_mix")) {
+    std::stringstream ss(kv["no_mix"]); std::string pair;
+    while (std::getline(ss, pair, ',')) {
+      if (pair.empty()) continue;
+      auto plus = pair.find('+');
+      if (plus == std::string::npos || plus == 0 || plus + 1 >= pair.size()) {
+        std::fprintf(stderr, "参数 no_mix 格式应为 a+b,c+d，收到 \"%s\"\n", pair.c_str());
+        return 2;
+      }
+      NO_MIX.emplace_back(pair.substr(0, plus), pair.substr(plus + 1));
+    }
+    if (NO_MIX.empty()) { std::fprintf(stderr, "参数 no_mix 为空（应为 carton+pallet 这种）\n"); return 2; }
+  }
+  if (CT.empty()) {
+    if (kv.count("only")) std::fprintf(stderr, "参数 only=%s 没有匹配的柜型\n", kv["only"].c_str());
+    else std::fprintf(stderr, "empty problem\n");
+    return 2;
+  }
+  if (IT.empty()) { std::fprintf(stderr, "empty problem\n"); return 2; }
 
   auto t0 = std::chrono::steady_clock::now();
   auto elapsed = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); };
