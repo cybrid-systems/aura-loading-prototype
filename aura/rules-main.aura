@@ -1,0 +1,95 @@
+;; 规则热替换：读 PC_RULES_BASE / PC_RULES，用同一份内核二进制重解，旧方案按新规则复核。
+;; 不编译 C++。结果写 record.txt（给 ./run.sh rules 打印）和 explain.md（给调度员）。
+(define (split-ws s)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (start 0) (acc (list)))
+      (cond ((= i n) (reverse (if (> i start) (cons (substring s start i) acc) acc)))
+            ((char=? (string-ref s i) #\space) (loop (+ i 1) (+ i 1) (if (> i start) (cons (substring s start i) acc) acc)))
+            (else (loop (+ i 1) start acc))))))
+
+(define (base-name path)
+  (let ((p (split-ws (list->string (map (lambda (c) (if (char=? c #\/) #\space c)) (string->list path))))))
+    (list-ref p (- (length p) 1))))
+
+(define (load-rules path) (read-from-string (read-file path)))
+
+(define (floor-bad rs)
+  (cond ((< (rule-num rs 'hard 'lifo 0 0) 1) "lifo 低于安全底线 1")
+        ((< (rule-num rs 'hard 'min-support 0 0) 0.75) "min-support 低于安全底线 0.75")
+        ((< (rule-num rs 'hard 'hazmat-sep 0 0) 1000) "hazmat-sep 低于安全底线 1000")
+        (else #f)))
+
+(define (read-plan path)
+  (let ((txt (read-file path)))
+    (if (and (string? txt) (> (string-length txt) 0))
+        (try (json-parse txt) (catch (e) #f))
+        #f)))
+
+(define fast-params "algo=block space=0 w_vol=1 w_yz=0.5 width=1 noise=0")
+
+(define (solve-plan order rs tag)
+  (let* ((pre (format "~a/~a" out-dir tag))
+         (out (kernel-launch order pre fast-params (rules->kernel-args rs) 1)))
+    (await-file (string-append pre ".done"))
+    (read-plan out)))
+
+(define (metric-line tag p)
+  (if p
+      (let ((m (hget p "metrics" #f)))
+        (format "~a containers=~a mix=~a cost=~a unplaced=~a"
+                tag (hget m "containers" "?") (hget m "mix" "?") (r3 (hget m "cost" 0)) (hget m "unplaced" "?")))
+      (format "~a missing" tag)))
+
+(define (cost-of p) (if p (r3 (hget (hget p "metrics" #f) "cost" 0)) "-"))
+
+(define out-dir (let ((o (getenv "PC_OUT"))) (if (and (string? o) (> (string-length o) 0)) o "out/rules-demo")))
+(sh (string-append "mkdir -p " out-dir))
+(define base-path (getenv "PC_RULES_BASE"))
+(define new-path (getenv "PC_RULES"))
+(define order (getenv "PC_ORDER"))
+(define base-rules (load-rules base-path))
+(define new-rules (load-rules new-path))
+(define why (floor-bad new-rules))
+(define lines (list))
+(define (emit! s) (set! lines (cons s lines)))
+
+(if why
+    (begin
+      (emit! (format "FLOOR bad ~a" why))
+      (write-file (string-append out-dir "/record.txt") (join-strings (reverse lines) "\n"))
+      (write-file (string-append out-dir "/explain.md")
+                  (format "# 规则热替换\n\n拒绝：~a\n\n这份规则没有拿去重解。\n" why))
+      (display "@@done=refused") (newline))
+    (begin
+      (emit! "FLOOR ok")
+      (emit! (format "ARGS ~a" (rules->kernel-args new-rules)))
+      (emit! (format "ORDER ~a" order))
+      (emit! (format "BASE_RULES ~a" base-path))
+      (emit! (format "NEW_RULES ~a" new-path))
+      (let ((old (solve-plan order base-rules "old"))
+            (new (solve-plan order new-rules "new")))
+        (emit! (metric-line "OLD" old))
+        (emit! (metric-line "NEW" new))
+        (for-each (lambda (h) (emit! (format "HIT_OLD ~a" h))) (if old (check-plan new-rules old) (list "内核无输出")))
+        (for-each (lambda (h) (emit! (format "HIT_NEW ~a" h))) (if new (check-plan new-rules new) (list "内核无输出")))
+        (for-each
+          (lambda (hpath)
+            (let* ((nm (base-name hpath))
+                   (b (solve-plan hpath base-rules (format "hist-base-~a" nm)))
+                   (n (solve-plan hpath new-rules (format "hist-new-~a" nm)))
+                   (hs (if n (check-plan new-rules n) (list "内核无输出"))))
+              (emit! (format "REPLAY ~a ~a ~a ~a" nm (cost-of b) (cost-of n) (length hs)))
+              (for-each (lambda (h) (emit! (format "REPLAY_HIT ~a ~a" nm h))) hs)))
+          (split-ws (getenv "PC_HISTORY"))))
+      (write-file (string-append out-dir "/record.txt") (join-strings (reverse lines) "\n"))
+      (write-file (string-append out-dir "/explain.md")
+                  (join-strings
+                    (append (list "# 规则热替换" ""
+                                  (format "- 基线：~a" base-path)
+                                  (format "- 新规则：~a" new-path)
+                                  (format "- 传给内核（没有重编译）：~a" (rules->kernel-args new-rules))
+                                  "")
+                            (reverse lines)
+                            (list "" "旧方案按新规则复核；新方案和历史回放都用同一份规则文件。"))
+                    "\n"))
+      (display "@@done=ok") (newline)))

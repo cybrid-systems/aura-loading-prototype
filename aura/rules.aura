@@ -1,7 +1,7 @@
 ;; aura/rules.aura — 配仓规则 EDSL（规则即数据，运行时可替换，不改内核代码）
 ;;
 ;; 一条规则： (类别 名称 参数... "说明")
-;;   hard   —— 下推给 C++ 内核作为硬约束（支撑率、先卸后装、危险品间距、柜型限定…）
+;;   hard   —— 下推给 C++ 内核作为硬约束（支撑率、先卸后装、危险品间距、柜型、限重、禁混装…）
 ;;   check  —— 方案出来后由 Aura 校验（重心范围、端部载荷、未装箱数、最低利用率…），不满足即否决
 ;;   prefer —— 软目标，进入协调器加权评分
 ;; 规则集是普通 list，可以在运行时 rebind / 从文件 load，再由 compile-rules 编译成内核参数 + 校验谓词。
@@ -29,21 +29,37 @@
                             ((and (eq? (rule-kind (car xs)) kind) (eq? (rule-name (car xs)) name)) (car xs))
                             (else (loop (cdr xs))))))
 (define (rule-num rs kind name i dflt) (let ((r (find-rule rs kind name))) (if r (rule-arg r i) dflt)))
+(define (sym->str x) (format "~a" x))
+(define (but-last xs) (reverse (cdr (reverse xs))))
+(define (push! xs x) (append xs (list x)))
 
-;; hard 规则 -> 内核命令行参数
+;; hard / check -> 内核命令行参数。顺序固定，方便和 tools/ruleset.py 对拍。
+;; only-type、allow-types、max-kg、no-mix 只在规则文件里出现时才传；不传则内核与改规则之前完全一样。
 (define (rules->kernel-args rs)
-  (let ((a (list)))
-    (for-each (lambda (r)
-                (let ((n (rule-name r)))
-                  (cond ((eq? n 'min-support) (set! a (cons (format "min_support=~a" (rule-arg r 0)) a)))
-                        ((eq? n 'lifo) (set! a (cons (format "lifo=~a" (rule-arg r 0)) a)))
-                        ((eq? n 'hazmat-sep) (set! a (cons (format "hazmat_sep=~a" (rule-arg r 0)) a)))
-                        ((eq? n 'only-type) (set! a (cons (format "only=~a" (rule-arg r 0)) a))))))
-              (rules-of 'hard rs))
-    (let ((cx (find-rule rs 'check 'cog-x)) (cy (find-rule rs 'check 'cog-y)))
-      (if cx (set! a (cons (format "cog_x_lo=~a cog_x_hi=~a" (rule-arg cx 0) (rule-arg cx 1)) a)) #f)
-      (if cy (set! a (cons (format "cog_y_lo=~a cog_y_hi=~a" (rule-arg cy 0) (rule-arg cy 1)) a)) #f))
-    (join-strings (reverse a) " ")))
+  (let ((a (list))
+        (ms (find-rule rs 'hard 'min-support))
+        (lf (find-rule rs 'hard 'lifo))
+        (hz (find-rule rs 'hard 'hazmat-sep))
+        (ot (find-rule rs 'hard 'only-type))
+        (at (find-rule rs 'hard 'allow-types))
+        (mk (find-rule rs 'hard 'max-kg))
+        (mix (filter (lambda (r) (eq? (rule-name r) 'no-mix)) (rules-of 'hard rs)))
+        (cx (find-rule rs 'check 'cog-x))
+        (cy (find-rule rs 'check 'cog-y)))
+    (if ms (set! a (push! a (format "min_support=~a" (rule-arg ms 0)))) #f)
+    (if lf (set! a (push! a (format "lifo=~a" (rule-arg lf 0)))) #f)
+    (if hz (set! a (push! a (format "hazmat_sep=~a" (rule-arg hz 0)))) #f)
+    (if ot (set! a (push! a (format "only=~a" (sym->str (rule-arg ot 0))))) #f)
+    (if at (set! a (push! a (format "types=~a" (join-strings (map sym->str (but-last (rule-args at))) ",")))) #f)
+    (if mk (set! a (push! a (format "cap_kg=~a" (rule-arg mk 0)))) #f)
+    (if (null? mix) #f
+        (set! a (push! a (format "no_mix=~a"
+                                 (join-strings (map (lambda (r) (format "~a+~a" (sym->str (rule-arg r 0)) (sym->str (rule-arg r 1)))) mix) ",")))))
+    (if cx (begin (set! a (push! a (format "cog_x_lo=~a" (rule-arg cx 0))))
+                  (set! a (push! a (format "cog_x_hi=~a" (rule-arg cx 1))))) #f)
+    (if cy (begin (set! a (push! a (format "cog_y_lo=~a" (rule-arg cy 0))))
+                  (set! a (push! a (format "cog_y_hi=~a" (rule-arg cy 1))))) #f)
+    (join-strings a " ")))
 
 (define (join-strings xs sep)
   (if (null? xs) "" (foldl (lambda (acc x) (string-append acc sep x)) (car xs) (cdr xs))))
@@ -73,9 +89,56 @@
                        cs))
             ((eq? n 'min-vol-util)
              (if (< (hget m "vol_util" 0) (rule-arg r 0)) (set! bad (cons (format "体积利用率 ~a < ~a" (r3 (hget m "vol_util" 0)) (rule-arg r 0)) bad)) #f))
+            ((eq? n 'only-type)
+             (let ((want (sym->str (rule-arg r 0))))
+               (for-each (lambda (c)
+                           (if (equal? (hget c "type" "") want) #f
+                               (set! bad (cons (format "规则 only-type：柜型 ~a 不在允许列表（只要 ~a）" (hget c "type" "?") want) bad))))
+                         cs)))
+            ((eq? n 'allow-types)
+             (let ((ok (map sym->str (but-last (rule-args r)))))
+               (for-each (lambda (c)
+                           (if (str-in? (hget c "type" "") ok) #f
+                               (set! bad (cons (format "规则 allow-types：柜型 ~a 不在允许列表" (hget c "type" "?")) bad))))
+                         cs)))
+            ((eq? n 'max-kg)
+             (for-each (lambda (c)
+                         (if (> (hget c "kg" 0) (rule-arg r 0))
+                             (set! bad (cons (format "规则 max-kg：~a 毛重 ~akg > ~a" (hget c "type" "?") (round (hget c "kg" 0)) (rule-arg r 0)) bad))
+                             #f))
+                       cs))
+            ((eq? n 'no-mix)
+             (let ((a (sym->str (rule-arg r 0))) (b (sym->str (rule-arg r 1))))
+               (for-each (lambda (c)
+                           (let ((ks (box-classes c)))
+                             (if (and (str-in? a ks) (str-in? b ks))
+                                 (set! bad (cons (format "规则 no-mix：~a 同柜混装了 ~a 与 ~a" (hget c "type" "?") a b) bad))
+                                 #f)))
+                         cs)))
             (else #f))))
-      (rules-of 'check rs))
+      (append (rules-of 'check rs) (rules-of 'hard rs)))
     (reverse bad)))
 
 (define (r3 x) (/ (round (* x 1000.0)) 1000.0))
 (define (absf x) (if (< x 0) (- 0 x) x))
+
+(define (str-in? x xs)
+  (let loop ((ys xs))
+    (cond ((null? ys) #f)
+          ((equal? x (car ys)) #t)
+          (else (loop (cdr ys))))))
+
+(define (sku-class s)
+  (let ((n (string-length s)))
+    (let loop ((i 0))
+      (cond ((= i n) s)
+            ((char=? (string-ref s i) #\-) (substring s 0 i))
+            (else (loop (+ i 1)))))))
+
+(define (box-classes c)
+  (let ((acc (list)))
+    (for-each (lambda (b)
+                (let ((k (sku-class (hget b "sku" ""))))
+                  (if (str-in? k acc) #f (set! acc (cons k acc)))))
+              (hget c "boxes" (list)))
+    acc))

@@ -8,6 +8,7 @@ data/
 peicang-data/
 out/
 build/
+.aura/
 real_*.txt
 import_report.json
 __pycache__/

@@ -35,7 +35,7 @@ struct BParams {
 };
 static BParams BP;
 
-struct BType { double d[3]; int rot; double max_top; bool fragile; int stop; std::string hazmat;
+struct BType { double d[3]; int rot; double max_top; bool fragile; int stop; std::string hazmat, cls;
   std::vector<int> items; std::vector<double> pre; std::vector<std::array<double,3>> ors; double vol, dens; };
 static std::vector<BType> BT;
 
@@ -53,10 +53,11 @@ static void build_types(const std::vector<int>& items) {
   for (int i : items) {
     const Item& t = IT[i]; int rot = t.rot; if (BP.anyrot && rot == 1) rot = 0; if (!P.rotate) rot = 2;
     std::ostringstream k; k << t.l << '|' << t.w << '|' << t.h << '|' << rot << '|' << t.max_top << '|' << t.fragile << '|' << t.stop << '|' << t.hazmat;
+    if (!NO_MIX.empty()) k << '|' << sku_class(t.sku);  // otherwise two classes of the same size would share one block
     auto it = key.find(k.str()); int ti;
     if (it == key.end()) {
       ti = (int)BT.size(); key[k.str()] = ti; BType b; double s = 1 - BP.squeeze;
-      b.d[0] = t.l * s; b.d[1] = t.w * s; b.d[2] = t.h * s; b.rot = rot; b.max_top = t.max_top; b.fragile = t.fragile; b.stop = t.stop; b.hazmat = t.hazmat;
+      b.d[0] = t.l * s; b.d[1] = t.w * s; b.d[2] = t.h * s; b.rot = rot; b.max_top = t.max_top; b.fragile = t.fragile; b.stop = t.stop; b.hazmat = t.hazmat; b.cls = sku_class(t.sku);
       std::set<std::array<double,3>> os; double l = b.d[0], w = b.d[1], h = b.d[2];
       if (rot == 2) os.insert({l, w, h});
       else { os.insert({l, w, h}); os.insert({w, l, h});
@@ -132,6 +133,9 @@ struct Engine {
     const BType& T = BT[k.t]; const auto& o = T.ors[k.o]; int n = k.nx * k.ny * k.nz;
     double kg = T.pre[s.used[k.t] + n] - T.pre[s.used[k.t]];
     if (s.kg + kg > c->max_kg + 1e-6) return false;
+    if (!NO_MIX.empty())
+      for (const auto& pb : s.bl)
+        if (classes_banned(T.cls, BT[pb.t].cls)) return false;
     if (k.nz > 1 && IT[T.items[s.used[k.t]]].kg > T.max_top + 1e-6) return false;  // box on box inside the block
     double X1 = x + o[0] * k.nx, Y1 = y + o[1] * k.ny;
     if (z > 1e-6) {
@@ -177,6 +181,11 @@ struct Engine {
     const BType& A = BT[a.t]; const BType& B = BT[b.t];
     double kgB = B.pre[s.used[b.t] + b.nx * b.ny * b.nz] - B.pre[s.used[b.t]];
     if (s.kg + ka + kgB > c->max_kg + 1e-6) return false;
+    if (!NO_MIX.empty()) {
+      if (classes_banned(A.cls, B.cls)) return false;
+      for (const auto& q : s.bl)
+        if (classes_banned(B.cls, BT[q.t].cls)) return false;
+    }
     double above_per_col = IT[B.items[s.used[b.t]]].kg * b.nz;  // heaviest B boxes, conservatively
     if (above_per_col > A.max_top + 1e-6) return false;
     if (multistop && P.lifo) {

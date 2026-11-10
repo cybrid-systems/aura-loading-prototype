@@ -35,6 +35,7 @@ AURA_ENTRY = {
     "evolve": "aura/evolve-main.aura",
     "tune": "aura/tune-main.aura",
     "consolidate": "aura/consolidate-main.aura",
+    "gate": "aura/gate-main.aura",
 }
 
 CONS_PRESET = {
@@ -196,11 +197,12 @@ def fill_defaults(env, spec):
 
 def cmd_aura(args):
     if not args or args[0] in ("-h", "--help"):
-        say("python3 build.py aura {main|evolve|tune|consolidate} [KEY=VALUE ...]")
+        say("python3 build.py aura {main|evolve|tune|consolidate|gate} [KEY=VALUE ...]")
         say("  main          PC_ORDERS=order_01 order_07  PC_OUT=out/aura")
         say("  evolve        PC_ORDERS=order_01–04  PC_FEEDBACK=examples/feedback.synthetic.txt  PC_OUT=out/evo")
         say("  tune          PC_TRAIN=order_01–06  PC_HOLDOUT=order_1*  PC_GENS=3  PC_OUT=out/tune")
         say("  consolidate   PC_CONS_GROUPS=examples/pool/pools.json  PC_OUT=out/cons-aura  PC_CONS_TIME_S=30")
+        say("  gate          安全门禁演示。调度员直接跑 ./run.sh evolve")
         say("也可以直接给 aura 文件：python3 build.py aura aura/main.aura")
         sys.exit(0 if args else 2)
     name, overrides = args[0], args[1:]
@@ -227,11 +229,16 @@ def cmd_aura(args):
                 "PC_OUT": "out/cons-aura",
                 "PC_CONS_TIME_S": "30",
             },
+            "gate": {
+                "PC_ORDERS": "examples/rules-demo/order.txt",
+                "PC_OUT": "out/evolve-demo",
+                "PC_TIME_MS": "200",
+            },
         }[name]
     elif name.endswith(".aura"):
         entry, spec = name, {}
     else:
-        sys.exit(f"未知 Aura 入口 {name}。可选：main evolve tune consolidate")
+        sys.exit(f"未知 Aura 入口 {name}。可选：main evolve tune consolidate gate")
     env = os.environ.copy()
     applied = fill_defaults(env, spec)
     for item in overrides:
@@ -332,7 +339,7 @@ def cmd_help(_args):
     say("  demo [--block]         order_10 求解 + verify + viz")
     say("  pack --in ... --out ...  把参数原样交给内核")
     say("  verify / viz           转给 tools/verify.py、tools/viz.py")
-    say("  aura NAME [K=V]        main | evolve | tune | consolidate")
+    say("  aura NAME [K=V]        main | evolve | tune | consolidate | gate")
     say("  bench [args]           默认合成基准，2s，--strategies --aura")
     say("  consolidate [nf|ff|ffd|lns] [args]")
     say("                         默认 lns，120s；nf/ff/ffd 只用 45HC")

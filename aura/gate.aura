@@ -1,0 +1,100 @@
+;; 安全演化演示：几个候选各自在 overlay 里回放一单，门禁不过就 rollback。
+;; 候选里故意包含放松先卸后装、压缩、倒放。屏幕上的 KEEP/ROLLBACK 来自这里的审计表。
+(define active-rules default-rules)
+(define base-params "algo=block space=0 w_vol=1.0 w_yz=0.5 width=1 noise=0 squeeze=0 anyrot=0")
+
+(define (with-rule rs kind name new-args)
+  (map (lambda (r) (if (and (eq? (rule-kind r) kind) (eq? (rule-name r) name)) (cons kind (cons name new-args)) r)) rs))
+
+(define (read-plan path)
+  (let ((txt (read-file path)))
+    (if (and (string? txt) (> (string-length txt) 0))
+        (try (json-parse txt) (catch (e) #f))
+        #f)))
+
+(define (solve-here order rs ps tag seed)
+  (let* ((pre (format "~a/~a" out-dir tag))
+         (out (kernel-launch order pre ps (rules->kernel-args rs) seed)))
+    (await-file (string-append pre ".done"))
+    (read-plan out)))
+
+(define (gate-reason rs ps cost viol base-cost base-viol fb?)
+  (cond ((< (rule-num rs 'hard 'lifo 0 0) 1) "放松了安全底线（先卸后装）")
+        ((< (rule-num rs 'hard 'min-support 0 0) 0.75) "放松了安全底线（支撑率）")
+        ((< (rule-num rs 'hard 'hazmat-sep 0 0) 1000) "放松了安全底线（危险品间距）")
+        ((string-contains? ps "squeeze=0.02") "放松了刚性底线（压缩）")
+        ((string-contains? ps "anyrot=1") "放松了刚性底线（倒放）")
+        ((not cost) "内核无输出")
+        ((> viol base-viol) "违例数上升")
+        ((and (not fb?) (>= cost base-cost)) "总运费无下降")
+        ((and fb? (> cost (* 1.05 base-cost))) "安全收紧导致运费上升超过 5%")
+        (else #f)))
+
+;; 一个候选：自己的 fiber + overlay。json-parse 留在主 fiber（并发 json-parse 会崩）。
+(define (eval-candidate step label rs ps order base-cost base-viol fb?)
+  (let* ((pathch (channel:create 2)) (fin (channel:create 2)) (ver (channel:create 1))
+         (pre (format "~a/g~a" out-dir step))
+         (f (spawn-reporting fin label
+              (lambda ()
+                (let ((label label) (rs rs) (ps ps) (order order) (pre pre) (pathch pathch) (ver ver))
+                  (try
+                    (begin
+                      (fiber:overlay-begin)
+                      (fiber:overlay-define "gate-trial" label)
+                      (let ((out (kernel-launch order pre ps (rules->kernel-args rs) (+ 3 step))))
+                        (await-file (string-append pre ".done"))
+                        (channel:send pathch out)
+                        (let ((v (channel:recv ver)))
+                          (if (equal? v "commit")
+                              (begin (fiber:overlay-commit) (format "~a:committed" label))
+                              (begin (fiber:overlay-rollback) (format "~a:rolled-back" label))))))
+                    (catch (e)
+                      (begin (channel:send pathch (list 'error (format "~a" e))) "error")))))))
+         (msg (channel:recv pathch))
+         (parsed (if (string? msg) (read-plan msg) #f))
+         (cost (if parsed (plan-cost parsed) #f))
+         (viol (if parsed (length (check-plan rs parsed)) 99))
+         (reason (if (string? msg)
+                     (gate-reason rs ps cost viol base-cost base-viol fb?)
+                     "候选出错"))
+         (dec (if reason "ROLLBACK" "KEEP")))
+    (if (string? msg) (channel:send ver (if reason "rollback" "commit")) #f)
+    (let ((st (channel:recv fin)))
+      (fiber:join f)
+      (list dec label (if cost (r3 cost) "-") viol (if reason reason (if fb? "满足现场反馈，运费增幅 ≤5%" "运费下降")) st))))
+
+(define (gate-run order)
+  (let* ((base (solve-here order active-rules base-params "base" 1))
+         (base-cost (if base (plan-cost base) 1e9))
+         (base-viol (if base (length (check-plan active-rules base)) 99))
+         (cands (list
+                  (list "关闭先卸后装" (with-rule active-rules 'hard 'lifo (list 0 "关闭先卸后装")) base-params #f)
+                  (list "压缩容差 0→0.02" active-rules "algo=block space=0 w_vol=1.0 w_yz=0.5 width=1 noise=0 squeeze=0.02 anyrot=0" #f)
+                  (list "允许倒放 0→1" active-rules "algo=block space=0 w_vol=1.0 w_yz=0.5 width=1 noise=0 squeeze=0 anyrot=1" #f)
+                  (list "门端载荷 18000→15000" (with-rule active-rules 'check 'end-load (list 15000 "单端载荷 ≤ 15000kg（反馈）")) base-params #t)))
+         (step 0)
+         (rows (list)))
+    (for-each
+      (lambda (c)
+        (set! step (+ step 1))
+        (set! rows (cons (eval-candidate step (car c) (cadr c) (caddr c) order base-cost base-viol (list-ref c 3)) rows)))
+      cands)
+    (let ((body (reverse rows))
+          (audit (list "decision\tchange\tcost_before\tcost_after\tviol_before\tviol_after\treason\toverlay")))
+      (for-each
+        (lambda (row)
+          (set! audit (append audit (list (format "~a\t~a\t~a\t~a\t~a\t~a\t~a\t~a"
+                                                  (list-ref row 0) (list-ref row 1) (r3 base-cost) (list-ref row 2)
+                                                  base-viol (list-ref row 3) (list-ref row 4) (list-ref row 5))))))
+        body)
+      (write-file (string-append out-dir "/evolve-audit.tsv") (join-strings audit "\n"))
+      (write-file (string-append out-dir "/explain.md")
+                  (join-strings
+                    (append (list "# 安全演化" ""
+                                  "每个候选在自己的 overlay 里回放这一单。门禁不过就 rollback，通过才 commit。"
+                                  "放松先卸后装、压缩、倒放即使运费不变或下降，也必须 ROLLBACK。"
+                                  "")
+                            (cdr audit)
+                            (list "" (format "审计：~a/evolve-audit.tsv" out-dir)))
+                    "\n"))
+      body)))

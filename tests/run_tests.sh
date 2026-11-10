@@ -2,6 +2,10 @@
 # 端到端测试（只用合成数据）。需在 Aura dev 镜像内运行，AURA_BIN 指向 aura 可执行文件。
 set -euo pipefail
 cd "$(dirname "$0")/.."
+if [ -z "${AURA_BIN:-}" ] && [ -x .aura/current/bin/aura ]; then
+  export AURA_BIN="$PWD/.aura/current/bin/aura"
+  export AURA_PATH="${AURA_PATH:-$PWD/.aura/current/lib}"
+fi
 J=${J:-$(nproc)}
 mkdir -p out/test
 python3 build.py
@@ -169,4 +173,28 @@ uncaptured = 1 - omean / pmean if pmean else 1
 assert uncaptured < 0.05, (uncaptured, pmean, omean)
 assert r["drift"].get("first_drift_week") is not None or r["windows"] < 28
 PY
+# 13) 客户规则热替换（不重编内核）+ 安全门禁演示。合成数据。
+if python3 tests/test_rules.py > out/test/rules.log 2>&1; then echo "ok   rules-hot-swap"; else cat out/test/rules.log; echo "FAIL rules-hot-swap"; fail=1; fi
+if python3 tools/demo_dx.py rules > out/test/rules-aura.log 2>&1 \
+   && grep -q "规则 no-mix" out/test/rules-aura.log && grep -q "旧方案被拒绝" out/test/rules-aura.log \
+   && grep -q "未重编译" out/test/rules-aura.log && grep -q "回放" out/test/rules-aura.log; then
+  echo "ok   rules-aura"
+else
+  echo "FAIL rules-aura"; tail -40 out/test/rules-aura.log; fail=1
+fi
+if python3 tools/demo_dx.py evolve > out/test/gate.log 2>&1 \
+   && grep -q "ROLLBACK" out/test/gate.log && grep -q "先卸后装" out/test/gate.log \
+   && grep -q "压缩" out/test/gate.log && grep -q "倒放" out/test/gate.log \
+   && grep -q "KEEP" out/test/gate.log && grep -q "evolve-audit.tsv" out/test/gate.log; then
+  echo "ok   gate-demo"
+else
+  echo "FAIL gate-demo"; tail -40 out/test/gate.log; fail=1
+fi
+if python3 tools/demo_dx.py agents > out/test/agents-demo.log 2>&1 \
+   && grep -q "胜者" out/test/agents-demo.log && grep -q "回滚" out/test/agents-demo.log \
+   && grep -q "explain.md" out/test/agents-demo.log; then
+  echo "ok   agents-demo"
+else
+  echo "FAIL agents-demo"; tail -40 out/test/agents-demo.log; fail=1
+fi
 exit $fail

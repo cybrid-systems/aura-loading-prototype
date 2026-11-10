@@ -1,0 +1,13 @@
+;; 入口：PC_ORDERS 给一单（演示用合成小单），PC_OUT 放审计和解释。
+(define (split-ws s)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (start 0) (acc (list)))
+      (cond ((= i n) (reverse (if (> i start) (cons (substring s start i) acc) acc)))
+            ((char=? (string-ref s i) #\space) (loop (+ i 1) (+ i 1) (if (> i start) (cons (substring s start i) acc) acc)))
+            (else (loop (+ i 1) start acc))))))
+
+(define out-dir (let ((o (getenv "PC_OUT"))) (if (and (string? o) (> (string-length o) 0)) o "out/evolve-demo")))
+(sh (string-append "mkdir -p " out-dir))
+(define order (car (split-ws (getenv "PC_ORDERS"))))
+(gate-run order)
+(display "@@done=ok") (newline)
