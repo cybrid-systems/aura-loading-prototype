@@ -1,0 +1,23 @@
+;; Smaller cousin of repro/json_parse_fibers.aura (aura#4788, closed).
+;; Concurrent json-parse of one file from several fibers.
+(define (range n)
+  (let loop ((i (- n 1)) (a (list)))
+    (if (< i 0) a (loop (- i 1) (cons i a)))))
+(define path (let ((p (getenv "JSON_PATH"))) (if (string? p) p "repro/v020/small.json")))
+(define (round)
+  (let* ((res (channel:create 8))
+         (fs (map (lambda (k)
+                    (fiber:spawn (lambda ()
+                      (let ((res res) (path path))
+                        (channel:send res (json-parse (read-file path)))))))
+                  (range 6))))
+    (let ((ps (map (lambda (f) (channel:recv res)) fs)))
+      (for-each fiber:join fs)
+      (length ps))))
+(let loop ((i 0))
+  (if (< i 20)
+      (begin
+        (display (format "@@round~a=~a" i (round))) (newline)
+        (loop (+ i 1)))
+      #t))
+(display "@@status=ok") (newline)

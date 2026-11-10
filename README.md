@@ -73,6 +73,7 @@ python3 build.py demo --block                      # 块构造 + 校验 + 3D 回
 python3 slotting/run_slotting.py --seeds 7,11,13,17,19
 AURA_PATH=/path/to/aura/lib tools/portfolio_v02.sh all
 python3 tests/test_slotting.py                     # 成本模型 / 约束 / B1 判据 / B3
+AURA_BIN=/path/to/aura-0.2.0/bin/aura python3 bench/v020/run_v020.py
 ```
 
 运费是相对值（20GP/40HQ/45HC = 1.00/1.60/1.85），真实报价用 `PEICANG_CONTAINERS` 替换。仓库不包含任何客户数据；示例和测试全部由 `tools/gen_synthetic.py` 生成。

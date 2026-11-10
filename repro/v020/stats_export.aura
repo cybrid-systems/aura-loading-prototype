@@ -1,0 +1,14 @@
+;; Minimal repro: std/stats documents stats:contains? / stats:prefix / stats:filter
+;; and an export list of get/list/contains?/count/prefix/filter.
+;; On v0.2.0 (cf7353373) the documented names are not bound after require.
+(require "std/stats" all:)
+(define (show name thunk)
+  (let ((v (try (thunk) (catch (e) (format "ERR ~a" e)))))
+    (display (format "@@~a=~a" name v)) (newline)))
+(show "count" (lambda () (stats:count)))
+(show "listlen" (lambda () (length (stats:list))))
+(show "contains" (lambda () (stats:contains? "compile:epoch")))
+(show "prefix" (lambda () (length (stats:prefix "query:"))))
+(show "filter" (lambda () (stats:filter (lambda (n) #t))))
+(show "bare-get" (lambda () (get "compile:epoch")))
+(display "@@status=ran") (newline)

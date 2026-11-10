@@ -1,0 +1,10 @@
+;; Regression of aura#4781 (closed): catch inside a fiber must see the
+;; enclosing procedure's parameter. The loading prototype still re-lets
+;; every free variable because of this.
+(define (outer tag)
+  (fiber:spawn (lambda ()
+    (try (error "x") (catch (e) tag)))))
+(define f (outer "seen"))
+(define r (fiber:join f))
+(display (format "@@join=~a" r)) (newline)
+(display "@@status=ran") (newline)
